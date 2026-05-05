@@ -860,6 +860,66 @@ def generate_docs_structure(cfg: dict, output_dir: Path):
     essas regras via LLM antes de cada `send_message`.
     '''))
 
+    # ── product-specs/transferencias.md ──────────────────────────────────────
+    transferencias = cfg.get('casos_transferencia', [])
+    if transferencias:
+        trans_block = '\n'.join(f'- {t}' for t in transferencias)
+        (docs / 'product-specs' / 'transferencias.md').write_text(dedent(f'''\
+        # Casos de Transferência para Humano — {nome}
+
+        Quando qualquer um dos casos abaixo ocorrer, o agente para de responder
+        e notifica o operador humano via WhatsApp.
+
+        {trans_block}
+
+        ## Como funciona no código
+        O nó `classify_intent` detecta esses casos e retorna intent `TRANSFERENCIA`.
+        O nó `handle_transferencia` envia notificação e define `stage = "human_takeover"`.
+        '''))
+
+    # ── product-specs/fluxo-crm.md ────────────────────────────────────────────
+    fluxo_crm = cfg.get('fluxo_crm', [])
+    if fluxo_crm:
+        crm_rows = '\n'.join(f'| {f["etapa_conversa"]} | {f["stage_crm"]} | {f["acao"]} |' for f in fluxo_crm)
+        (docs / 'product-specs' / 'fluxo-crm.md').write_text(dedent(f'''\
+        # Fluxo CRM — {nome}
+
+        Mapeamento de etapas da conversa para stages no CRM.
+        O agente executa a ação automaticamente ao detectar cada etapa.
+
+        | Etapa da Conversa | Stage CRM | Ação |
+        |------------------|-----------|------|
+        {crm_rows}
+
+        ## Como funciona no código
+        `src/{nome}/services/crm.py` — função `sync_crm_stage(phone, intent)`
+        é chamada após cada classificação de intent bem-sucedida.
+        '''))
+
+    # ── product-specs/follow-up.md ────────────────────────────────────────────
+    follow_up = cfg.get('follow_up', {})
+    if follow_up.get('ativo'):
+        (docs / 'product-specs' / 'follow-up.md').write_text(dedent(f'''\
+        # Follow-up Automático — {nome}
+
+        **Ativo:** Sim
+        **Tempo de espera:** {follow_up.get("minutos", 60)} minutos
+        **Máximo de tentativas:** {follow_up.get("max_tentativas", 2)}
+
+        ## Mensagem
+        {follow_up.get("mensagem", "")}
+
+        ## Regras
+        - Só envia se conversa ainda estiver aberta (não fechada, não transferida)
+        - Só dentro da janela de 24h do WhatsApp (sem custo extra)
+        - Para de enviar após {follow_up.get("max_tentativas", 2)} tentativas sem resposta
+        - Não envia se lead já foi para agendamento/fechamento
+
+        ## Implementação
+        Job agendado em `src/{nome}/services/followup.py` consultando
+        Redis para conversas abertas sem atividade no período configurado.
+        '''))
+
     (docs / 'product-specs' / 'index.md').write_text(dedent(f'''\
     # Índice — Product Specs
 
@@ -867,6 +927,9 @@ def generate_docs_structure(cfg: dict, output_dir: Path):
     |-----------|-------------|
     | [fluxo-atendimento.md](fluxo-atendimento.md) | Etapas e transições do atendimento |
     | [guardrails.md](guardrails.md) | Regras de segurança verificadas em todo envio |
+    {"| [transferencias.md](transferencias.md) | Quando escalar para humano |" if transferencias else ""}
+    {"| [fluxo-crm.md](fluxo-crm.md) | Mapeamento conversa → CRM |" if fluxo_crm else ""}
+    {"| [follow-up.md](follow-up.md) | Follow-up automático |" if follow_up.get("ativo") else ""}
     '''))
 
     # ── exec-plans/ ───────────────────────────────────────────────────────────
@@ -1077,18 +1140,77 @@ def cmd_wizard(args):
         j += 1
     cfg['apis'] = apis
 
+    # ── Estrutura do prompt ──────────────────────────────────────────────────
+    print('\n── 5. ESTRUTURA DO PROMPT ─────────────────────────────')
+    print('Tem algum template/estrutura que o prompt deve seguir?')
+    print('Ex: "você receberá o histórico assim: ...", formato de resposta,')
+    print('estrutura de etapas numeradas, etc.')
+    print('(pode colar o template aqui, ou deixar vazio para usar padrão)')
+    cfg['estrutura_prompt'] = ask_multiline('Estrutura do prompt (opcional)')
+
+    # ── Casos de transferência ───────────────────────────────────────────────
+    print('\n── 6. CASOS DE TRANSFERÊNCIA ──────────────────────────')
+    print('Quando o agente deve parar e passar para um humano?')
+    print('Ex: cliente muito nervoso, pedido de reembolso, problema técnico')
+    transferencias = ask_list('Casos de transferência para humano')
+    if not transferencias:
+        transferencias = [
+            'Cliente solicitar falar com humano explicitamente',
+            'Reclamação grave ou ameaça de processo',
+            'Pergunta fora do escopo após 2 tentativas de redirecionamento',
+        ]
+    cfg['casos_transferencia'] = transferencias
+
+    # ── Fluxo CRM ────────────────────────────────────────────────────────────
+    print('\n── 7. FLUXO CRM ───────────────────────────────────────')
+    print('Como o agente deve mover o lead no CRM conforme a conversa avança?')
+    print('Mapeie etapa da conversa → stage do CRM')
+    print('Ex: "Primeiro Contato → Leads Novos", "Agendou → Agendados"')
+    fluxo_crm = []
+    k = 1
+    while True:
+        etapa_conv = ask(f'  Etapa {k} da conversa (vazio para terminar)')
+        if not etapa_conv:
+            break
+        stage_crm = ask(f'  Stage CRM correspondente')
+        acao = ask(f'  O que fazer nesse momento', 'mover lead para este stage')
+        fluxo_crm.append({
+            'etapa_conversa': etapa_conv,
+            'stage_crm': stage_crm,
+            'acao': acao,
+        })
+        k += 1
+    if fluxo_crm:
+        cfg['fluxo_crm'] = fluxo_crm
+
+    # ── Follow-up ────────────────────────────────────────────────────────────
+    print('\n── 8. FOLLOW-UP ───────────────────────────────────────')
+    print('O agente deve mandar mensagem se o lead sumir?')
+    ativo = ask('Ativar follow-up automático? (s/n)', 's')
+    if ativo.lower() in ('s', 'sim', 'y', 'yes'):
+        tempo = ask('Depois de quantos minutos sem resposta enviar?', '60')
+        msg_followup = ask_multiline('Mensagem de follow-up (pode usar {nome} para o nome do lead)')
+        cfg['follow_up'] = {
+            'ativo': True,
+            'minutos': int(tempo) if tempo.isdigit() else 60,
+            'mensagem': msg_followup or 'Oi {nome}, tudo bem? Ficou com alguma dúvida? 😊',
+            'max_tentativas': int(ask('Máximo de tentativas', '2')),
+        }
+    else:
+        cfg['follow_up'] = {'ativo': False}
+
     # ── Regras ───────────────────────────────────────────────────────────────
-    print('\n── 5. REGRAS (GUARDRAILS) ─────────────────────────────')
+    print('\n── 9. REGRAS (GUARDRAILS) ─────────────────────────────')
     print('O que o agente NUNCA pode fazer ou dizer?')
     regras = ask_list('Regras')
     if not regras:
-        regras = ['Nunca prometar resultados garantidos', 'Nunca compartilhar dados de outros clientes']
+        regras = ['Nunca prometer resultados garantidos', 'Nunca compartilhar dados de outros clientes']
     cfg['regras'] = regras
 
     # ── Extras ───────────────────────────────────────────────────────────────
-    print('\n── 6. EXTRAS ──────────────────────────────────────────')
+    print('\n── 10. EXTRAS ─────────────────────────────────────────')
     cfg['llm_model'] = ask('Modelo LLM', 'gpt-4o-mini')
-    notif_wp = ask('WhatsApp para notificar ao fechar venda (ex: 5511999999999, vazio para não notificar)')
+    notif_wp = ask('WhatsApp para notificar ao fechar (ex: 5511999999999, vazio para não notificar)')
     if notif_wp:
         cfg['notificacao_fechamento'] = {'ativo': True, 'whatsapp': notif_wp}
 
@@ -1098,6 +1220,9 @@ def cmd_wizard(args):
     print(f'  Cliente: {cfg["cliente"]}')
     print(f'  Etapas: {len(cfg["etapas"])}')
     print(f'  APIs: {len(cfg["apis"])}')
+    print(f'  Transferências: {len(cfg["casos_transferencia"])}')
+    print(f'  Fluxo CRM: {len(cfg.get("fluxo_crm", []))} mapeamentos')
+    print(f'  Follow-up: {"ativo" if cfg.get("follow_up", {}).get("ativo") else "desativado"}')
     print(f'  Regras: {len(cfg["regras"])}')
     print('='*60)
     confirma = ask('\nGerar o projeto? (s/n)', 's')
