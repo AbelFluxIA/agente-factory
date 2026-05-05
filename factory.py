@@ -707,6 +707,7 @@ def cmd_create(args):
 
     # Copiar serviços base da Vanessa (whatsapp.py, memory/)
     _copy_base_services(output_dir, nome)
+    generate_docs_structure(cfg, output_dir)
 
     print(f"\n✅ Agente '{nome}' gerado em {output_dir}/")
     print(f"\nPróximos passos:")
@@ -780,28 +781,370 @@ def _copy_base_services(output_dir: Path, nome: str):
     print(f"   ✓ src/{nome}/memory/redis_memory.py")
 
 
+# ─── Gerador da estrutura de docs (padrão artigo OpenAI Codex) ───────────────
+
+def generate_docs_structure(cfg: dict, output_dir: Path):
+    """Gera docs/ organizado como índice — AGENTS.md curto aponta para cá."""
+    nome = cfg['nome']
+    cliente = cfg.get('cliente', nome)
+    etapas = cfg.get('etapas', [])
+    regras = cfg.get('regras', [])
+    apis = cfg.get('apis', [])
+
+    docs = output_dir / 'docs'
+
+    # ── design-docs/core-beliefs.md ──────────────────────────────────────────
+    (docs / 'design-docs').mkdir(parents=True, exist_ok=True)
+    (docs / 'design-docs' / 'core-beliefs.md').write_text(dedent(f'''\
+    # Crenças Centrais — {nome}
+
+    > Por que este agente existe e o que NÃO abrimos mão.
+
+    ## 1. O agente serve o humano, não o contrário
+    Cada interação deve deixar o lead com uma sensação positiva, independente
+    de fechar ou não. Nunca pressionar, nunca mentir.
+
+    ## 2. Transparência sobre limitações
+    Se o agente não sabe, ele diz "não sei" e oferece escalar para humano.
+    Prometer o que não existe destrói confiança.
+
+    ## 3. Contexto é memória
+    O agente lembra o que foi dito na conversa. Não repete perguntas.
+    Não finge que não houve mensagens anteriores.
+
+    ## 4. Velocidade não é pressa
+    Responder rápido é bom. Responder errado rápido é pior que demorar.
+    Guardrails existem para isso.
+
+    ## 5. Dados pertencem ao cliente
+    Nenhuma informação do lead é compartilhada, vendida ou usada fora
+    do contexto de atendimento de {cliente}.
+    '''))
+
+    # ── design-docs/index.md ─────────────────────────────────────────────────
+    (docs / 'design-docs' / 'index.md').write_text(dedent(f'''\
+    # Índice — Design Docs
+
+    | Documento | O que contém |
+    |-----------|-------------|
+    | [core-beliefs.md](core-beliefs.md) | Princípios inegociáveis do agente |
+    '''))
+
+    # ── product-specs/ ────────────────────────────────────────────────────────
+    (docs / 'product-specs').mkdir(parents=True, exist_ok=True)
+    etapas_block = '\n'.join(f'### {e["label"]} (`{e["intent"]}`)\n{e["descricao"]}\n\n**Resposta base:** {e["resposta_padrao"]}\n' for e in etapas)
+    (docs / 'product-specs' / 'fluxo-atendimento.md').write_text(dedent(f'''\
+    # Fluxo de Atendimento — {nome}
+
+    ## Etapas
+
+    {etapas_block}
+
+    ## Transições
+    - Qualquer etapa pode ir para `ENCERRAMENTO` se o lead quiser parar
+    - `OBJECAO_PRECO` tem até 2 tentativas antes de oferecer alternativa
+    - Após fechamento, notificar operador humano
+    '''))
+
+    regras_block = '\n'.join(f'- [ ] {r}' for r in regras)
+    (docs / 'product-specs' / 'guardrails.md').write_text(dedent(f'''\
+    # Guardrails — {nome}
+
+    Verificações executadas **antes de todo envio**. Se uma falhar, a
+    resposta é corrigida ou substituída por escalada para humano.
+
+    {regras_block}
+
+    ## Como verificar
+    O nó `apply_guardrails` em `src/{nome}/agent/nodes.py` executa
+    essas regras via LLM antes de cada `send_message`.
+    '''))
+
+    (docs / 'product-specs' / 'index.md').write_text(dedent(f'''\
+    # Índice — Product Specs
+
+    | Documento | O que contém |
+    |-----------|-------------|
+    | [fluxo-atendimento.md](fluxo-atendimento.md) | Etapas e transições do atendimento |
+    | [guardrails.md](guardrails.md) | Regras de segurança verificadas em todo envio |
+    '''))
+
+    # ── exec-plans/ ───────────────────────────────────────────────────────────
+    (docs / 'exec-plans' / 'active').mkdir(parents=True, exist_ok=True)
+    (docs / 'exec-plans' / 'completed').mkdir(parents=True, exist_ok=True)
+    (docs / 'exec-plans' / 'active' / '001-setup-inicial.md').write_text(dedent(f'''\
+    # 001 — Setup Inicial
+
+    **Status:** Em andamento
+    **Objetivo:** Colocar o agente {nome} em produção
+
+    ## Checklist
+
+    - [ ] Preencher `.env` com credenciais reais
+    - [ ] Configurar webhook no Meta Business
+    - [ ] Testar fluxo completo em ambiente de staging
+    - [ ] Configurar Redis e PostgreSQL em produção
+    - [ ] Deploy via `docker-compose up -d`
+    - [ ] Monitorar primeiros 48h de atendimento
+    - [ ] Ajustar prompts com base nos primeiros atendimentos reais
+
+    ## Critério de conclusão
+    Agente atende 10 leads reais sem intervenção humana com avaliação positiva.
+    '''))
+
+    (docs / 'exec-plans' / 'tech-debt-tracker.md').write_text(dedent(f'''\
+    # Tech Debt Tracker — {nome}
+
+    | Item | Prioridade | Criado em |
+    |------|-----------|-----------|
+    | Adicionar testes de integração para cada nó do grafo | Média | setup |
+    | Implementar retry com backoff para chamadas à Meta API | Alta | setup |
+    | Dashboard de métricas de conversas | Baixa | setup |
+    '''))
+
+    # ── references/ ───────────────────────────────────────────────────────────
+    (docs / 'references').mkdir(parents=True, exist_ok=True)
+    apis_ref = '\n\n'.join(
+        f'## {a["nome"]}\nURL: ${{{a["url_env"]}}}\nEndpoints: {", ".join(e["nome"] for e in a.get("endpoints", []))}'
+        for a in apis
+    ) if apis else '(sem APIs externas configuradas)'
+
+    (docs / 'references' / 'apis-externas.md').write_text(dedent(f'''\
+    # APIs Externas — Referência
+
+    {apis_ref}
+    '''))
+
+    (docs / 'references' / 'whatsapp-api.md').write_text(dedent('''\
+    # Meta Business API — Referência Rápida
+
+    ## Enviar mensagem de texto
+    POST https://graph.facebook.com/v19.0/{PHONE_NUMBER_ID}/messages
+    Authorization: Bearer {WHATSAPP_ACCESS_TOKEN}
+    Body: {"messaging_product":"whatsapp","to":"{phone}","type":"text","text":{"body":"..."}}
+
+    ## Webhook verification
+    GET /webhook?hub.mode=subscribe&hub.verify_token=...&hub.challenge=...
+
+    ## Tipos de mensagem suportados
+    - text, image, document, audio, video, location, template
+    '''))
+
+    # ── DESIGN.md e FRONTEND.md (se aplicável) ────────────────────────────────
+    (docs / 'DESIGN.md').write_text(dedent(f'''\
+    # Design System — {nome}
+
+    ## Voz e Tom
+    {cfg.get("prompt_personalidade", "").split(chr(10))[0]}
+
+    ## Princípios de mensagem
+    - Máximo 3 parágrafos por mensagem
+    - Emojis com moderação (1-2 por mensagem)
+    - Sempre terminar com uma pergunta ou CTA claro
+    - Nunca enviar blocos de texto > 300 palavras
+    '''))
+
+    (docs / 'PLANS.md').write_text(dedent(f'''\
+    # Planos Ativos — {nome}
+
+    Ver [exec-plans/active/](exec-plans/active/) para planos detalhados.
+
+    ## Resumo
+    | Plano | Status |
+    |-------|--------|
+    | [001-setup-inicial](exec-plans/active/001-setup-inicial.md) | Em andamento |
+    '''))
+
+    print(f"   ✓ docs/ (design-docs, product-specs, exec-plans, references)")
+
+
+# ─── Wizard interativo ────────────────────────────────────────────────────────
+
+def ask(prompt: str, default: str = '') -> str:
+    suffix = f' [{default}]' if default else ''
+    try:
+        resp = input(f'{prompt}{suffix}: ').strip()
+        return resp or default
+    except (EOFError, KeyboardInterrupt):
+        print()
+        sys.exit(0)
+
+def ask_multiline(prompt: str) -> str:
+    print(f'{prompt} (termine com uma linha vazia):')
+    lines = []
+    try:
+        while True:
+            line = input('  ')
+            if not line and lines:
+                break
+            lines.append(line)
+    except (EOFError, KeyboardInterrupt):
+        print()
+    return '\n'.join(lines)
+
+def ask_list(prompt: str) -> list[str]:
+    print(f'{prompt} (uma por linha, vazio para terminar):')
+    items = []
+    try:
+        while True:
+            item = input('  → ').strip()
+            if not item:
+                break
+            items.append(item)
+    except (EOFError, KeyboardInterrupt):
+        print()
+    return items
+
+def cmd_wizard(args):
+    """Modo interativo — o factory te pergunta tudo e gera o agente."""
+    print('\n' + '='*60)
+    print('  AGENTE FACTORY — Modo Wizard')
+    print('  Vou te fazer perguntas. No final, gero tudo.')
+    print('='*60 + '\n')
+
+    cfg = {}
+
+    # ── Identidade ───────────────────────────────────────────────────────────
+    print('── 1. IDENTIDADE ──────────────────────────────────────')
+    cfg['nome'] = slugify(ask('Nome do agente (ex: clinica_bella, pet_shop_rex)'))
+    cfg['cliente'] = ask('Nome do cliente/empresa (ex: Clínica Bella)')
+    cfg['descricao'] = ask('Uma linha descrevendo o que o agente faz')
+
+    # ── Personalidade ────────────────────────────────────────────────────────
+    print('\n── 2. PERSONALIDADE ───────────────────────────────────')
+    print('Descreva quem é o agente: nome, tom de voz, o que ele faz,')
+    print('o que NÃO faz. Seja específico — isso vira o system prompt.')
+    cfg['prompt_personalidade'] = ask_multiline('Personalidade')
+
+    # ── Etapas ───────────────────────────────────────────────────────────────
+    print('\n── 3. ETAPAS DE ATENDIMENTO ───────────────────────────')
+    print('Quais são as situações que o agente vai encontrar?')
+    print('Ex: primeiro contato, dúvida sobre produto, objeção de preço,')
+    print('pronto para comprar, quer cancelar, etc.')
+    print()
+    etapas = []
+    i = 1
+    while True:
+        print(f'Etapa {i} (vazio para terminar):')
+        label = ask('  Nome da etapa (ex: Primeiro Contato)')
+        if not label:
+            break
+        intent = slugify(label).upper()
+        descricao = ask(f'  O que acontece nessa etapa', f'Lead em etapa de {label}')
+        resposta = ask(f'  Mensagem base do agente nessa etapa')
+        etapas.append({
+            'intent': intent,
+            'label': label,
+            'descricao': descricao,
+            'resposta_padrao': resposta or f'...',
+        })
+        i += 1
+
+    if not etapas:
+        # etapas padrão mínimas
+        etapas = [
+            {'intent': 'INTERESSE_INICIAL', 'label': 'Primeiro Contato', 'descricao': 'Lead entrou em contato pela primeira vez', 'resposta_padrao': 'Olá! Como posso te ajudar?'},
+            {'intent': 'FECHAMENTO', 'label': 'Fechamento', 'descricao': 'Lead quer fechar', 'resposta_padrao': 'Ótimo! Vamos finalizar...'},
+        ]
+        print('  (usando etapas padrão)')
+    cfg['etapas'] = etapas
+
+    # ── APIs ─────────────────────────────────────────────────────────────────
+    print('\n── 4. APIS EXTERNAS ───────────────────────────────────')
+    print('O agente precisa consultar algum sistema externo?')
+    print('Ex: sistema de agendamento, catálogo de produtos, CRM, ERP...')
+    print()
+    apis = []
+    j = 1
+    while True:
+        nome_api = ask(f'API {j} — nome (vazio para pular)')
+        if not nome_api:
+            break
+        descricao_api = ask(f'  O que essa API faz')
+        url_env = ask(f'  Nome da variável de ambiente com a URL', f'{nome_api.upper()}_API_URL')
+        auth_env = ask(f'  Nome da variável de ambiente com a chave', f'{nome_api.upper()}_API_KEY')
+        print(f'  Endpoints dessa API (vazio para terminar):')
+        endpoints = []
+        while True:
+            ep_nome = ask('    Nome do endpoint (ex: verificar_disponibilidade)')
+            if not ep_nome:
+                break
+            ep_metodo = ask('    Método HTTP', 'GET').upper()
+            ep_path = ask('    Path (ex: /slots)', f'/{ep_nome}')
+            ep_desc = ask('    Descrição', ep_nome.replace('_', ' '))
+            endpoints.append({'nome': ep_nome, 'metodo': ep_metodo, 'path': ep_path, 'descricao': ep_desc})
+        apis.append({'nome': slugify(nome_api), 'descricao': descricao_api, 'url_env': url_env, 'auth_env': auth_env, 'endpoints': endpoints})
+        j += 1
+    cfg['apis'] = apis
+
+    # ── Regras ───────────────────────────────────────────────────────────────
+    print('\n── 5. REGRAS (GUARDRAILS) ─────────────────────────────')
+    print('O que o agente NUNCA pode fazer ou dizer?')
+    regras = ask_list('Regras')
+    if not regras:
+        regras = ['Nunca prometar resultados garantidos', 'Nunca compartilhar dados de outros clientes']
+    cfg['regras'] = regras
+
+    # ── Extras ───────────────────────────────────────────────────────────────
+    print('\n── 6. EXTRAS ──────────────────────────────────────────')
+    cfg['llm_model'] = ask('Modelo LLM', 'gpt-4o-mini')
+    notif_wp = ask('WhatsApp para notificar ao fechar venda (ex: 5511999999999, vazio para não notificar)')
+    if notif_wp:
+        cfg['notificacao_fechamento'] = {'ativo': True, 'whatsapp': notif_wp}
+
+    # ── Confirmar e gerar ────────────────────────────────────────────────────
+    print('\n' + '='*60)
+    print(f'  Agente: {cfg["nome"]}')
+    print(f'  Cliente: {cfg["cliente"]}')
+    print(f'  Etapas: {len(cfg["etapas"])}')
+    print(f'  APIs: {len(cfg["apis"])}')
+    print(f'  Regras: {len(cfg["regras"])}')
+    print('='*60)
+    confirma = ask('\nGerar o projeto? (s/n)', 's')
+    if confirma.lower() not in ('s', 'sim', 'y', 'yes', ''):
+        print('Cancelado.')
+        return
+
+    # Salva o config para referência futura
+    config_file = Path(f'{cfg["nome"]}.yaml')
+    with open(config_file, 'w') as f:
+        yaml.dump(cfg, f, allow_unicode=True, default_flow_style=False)
+    print(f'\n✓ Config salva em: {config_file}')
+
+    # Gera o projeto
+    class FakeArgs:
+        config = str(config_file)
+        output = None
+    cmd_create(FakeArgs())
+
+
 # ─── Entry point ─────────────────────────────────────────────────────────────
 
 def main():
     parser = argparse.ArgumentParser(description='Agente Factory — cria agentes WhatsApp IA')
     sub = parser.add_subparsers(dest='command')
 
+    sub.add_parser('wizard', help='Modo interativo — te pergunta tudo e gera o agente')
+
     init_p = sub.add_parser('init', help='Cria um config.yaml de exemplo')
     init_p.add_argument('--output', '-o', help='Nome do arquivo de saída (default: config.yaml)')
     init_p.add_argument('--force', '-f', action='store_true')
 
-    create_p = sub.add_parser('create', help='Gera o projeto do agente')
+    create_p = sub.add_parser('create', help='Gera o projeto a partir de um config.yaml existente')
     create_p.add_argument('--config', '-c', required=True, help='Arquivo config.yaml')
     create_p.add_argument('--output', '-o', help='Diretório de saída (default: nome do agente)')
 
     args = parser.parse_args()
 
-    if args.command == 'init':
+    if args.command == 'wizard':
+        cmd_wizard(args)
+    elif args.command == 'init':
         cmd_init(args)
     elif args.command == 'create':
         cmd_create(args)
     else:
         parser.print_help()
+        print('\nDica: comece com "python3 factory.py wizard" para modo interativo.')
 
 
 if __name__ == '__main__':
