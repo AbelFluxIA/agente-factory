@@ -25,6 +25,7 @@ O que é gerado:
 
 import argparse
 import os
+import subprocess
 import sys
 import yaml
 from pathlib import Path
@@ -393,6 +394,20 @@ def generate_apis_service(cfg: dict) -> str:
 
     return '\n'.join(clients)
 
+def generate_gitignore() -> str:
+    return dedent('''\
+    __pycache__/
+    *.py[cod]
+    *.egg-info/
+    .env
+    .venv/
+    venv/
+    dist/
+    build/
+    *.log
+    .DS_Store
+    ''')
+
 def generate_env_example(cfg: dict) -> str:
     apis = cfg.get('apis', [])
     api_vars = '\n'.join(
@@ -695,6 +710,7 @@ def cmd_create(args):
         f'src/{nome}/main.py':                generate_main(cfg),
         'AGENTS.md':                          generate_agents_md(cfg),
         '.env.example':                       generate_env_example(cfg),
+        '.gitignore':                         generate_gitignore(),
         'Dockerfile':                         generate_dockerfile(cfg),
         'docker-compose.yml':                 generate_docker_compose(cfg),
         'pyproject.toml':                     generate_pyproject(cfg),
@@ -710,11 +726,62 @@ def cmd_create(args):
     generate_docs_structure(cfg, output_dir)
 
     print(f"\n✅ Agente '{nome}' gerado em {output_dir}/")
+
+    repo_url = None
+    github_owner = getattr(args, 'github', None)
+    if github_owner:
+        repo_url = push_to_github(output_dir, nome, github_owner)
+
     print(f"\nPróximos passos:")
     print(f"  1. cd {output_dir}")
-    print(f"  2. cp .env.example .env && edite com suas chaves")
-    print(f"  3. uv sync")
-    print(f"  4. uv run uvicorn src.{nome}.main:app --reload")
+    print(f"  2. cp .env.example .env && preencha com suas chaves")
+    if repo_url:
+        print(f"  3. No EasyPanel: New App → GitHub → {repo_url}")
+        print(f"  4. Adicione as variáveis do .env no EasyPanel → Environment")
+    else:
+        print(f"  3. uv sync")
+        print(f"  4. uv run uvicorn src.{nome}.main:app --reload")
+
+
+def push_to_github(output_dir: Path, nome: str, github_owner: str, private: bool = True) -> str | None:
+    """Cria repo no GitHub e faz o primeiro push. Retorna a URL ou None se falhar."""
+    repo_name = nome.replace('_', '-')
+    visibility = '--private' if private else '--public'
+
+    # Verifica se gh está instalado
+    if subprocess.run(['which', 'gh'], capture_output=True).returncode != 0:
+        print('   ✗ GitHub CLI (gh) não encontrado. Instale em: https://cli.github.com')
+        return None
+
+    print(f'\n   Criando repositório {github_owner}/{repo_name}...')
+    r = subprocess.run(
+        ['gh', 'repo', 'create', f'{github_owner}/{repo_name}', visibility,
+         '--description', f'Agente IA: {nome} — gerado por agente-factory'],
+        capture_output=True, text=True,
+    )
+    if r.returncode != 0:
+        print(f'   ✗ Erro ao criar repo: {r.stderr.strip() or r.stdout.strip()}')
+        return None
+
+    repo_url = r.stdout.strip()
+    print(f'   ✓ Repositório criado: {repo_url}')
+
+    git_cmds = [
+        ['git', 'init'],
+        ['git', 'checkout', '-b', 'main'],
+        ['git', 'add', '.'],
+        ['git', 'commit', '-m', f'Initial commit — {nome} gerado por agente-factory'],
+        ['git', 'remote', 'add', 'origin', f'https://github.com/{github_owner}/{repo_name}.git'],
+        ['git', 'push', '-u', 'origin', 'main'],
+    ]
+    for cmd in git_cmds:
+        r = subprocess.run(cmd, capture_output=True, text=True, cwd=str(output_dir))
+        if r.returncode != 0:
+            print(f'   ✗ Erro em `{" ".join(cmd)}`: {r.stderr.strip()}')
+            return None
+
+    print(f'   ✓ Código enviado!')
+    return f'https://github.com/{github_owner}/{repo_name}'
 
 
 def _copy_base_services(output_dir: Path, nome: str):
@@ -1214,6 +1281,15 @@ def cmd_wizard(args):
     if notif_wp:
         cfg['notificacao_fechamento'] = {'ativo': True, 'whatsapp': notif_wp}
 
+    # ── GitHub ───────────────────────────────────────────────────────────────
+    print('\n── 11. GITHUB (OPCIONAL) ──────────────────────────────')
+    print('Posso criar o repositório no GitHub e fazer o primeiro push agora.')
+    print('Você precisará do GitHub CLI (gh) autenticado.')
+    push_github = ask('Criar repositório no GitHub? (s/n)', 'n')
+    github_owner = None
+    if push_github.lower() in ('s', 'sim', 'y', 'yes'):
+        github_owner = ask('Usuário ou organização no GitHub (ex: AbelFluxIA)')
+
     # ── Confirmar e gerar ────────────────────────────────────────────────────
     print('\n' + '='*60)
     print(f'  Agente: {cfg["nome"]}')
@@ -1224,6 +1300,8 @@ def cmd_wizard(args):
     print(f'  Fluxo CRM: {len(cfg.get("fluxo_crm", []))} mapeamentos')
     print(f'  Follow-up: {"ativo" if cfg.get("follow_up", {}).get("ativo") else "desativado"}')
     print(f'  Regras: {len(cfg["regras"])}')
+    if github_owner:
+        print(f'  GitHub: {github_owner}/{cfg["nome"].replace("_", "-")} (privado)')
     print('='*60)
     confirma = ask('\nGerar o projeto? (s/n)', 's')
     if confirma.lower() not in ('s', 'sim', 'y', 'yes', ''):
@@ -1240,6 +1318,7 @@ def cmd_wizard(args):
     class FakeArgs:
         config = str(config_file)
         output = None
+        github = github_owner
     cmd_create(FakeArgs())
 
 
@@ -1258,6 +1337,7 @@ def main():
     create_p = sub.add_parser('create', help='Gera o projeto a partir de um config.yaml existente')
     create_p.add_argument('--config', '-c', required=True, help='Arquivo config.yaml')
     create_p.add_argument('--output', '-o', help='Diretório de saída (default: nome do agente)')
+    create_p.add_argument('--github', '-g', help='Usuário/org GitHub para criar repo e fazer push (ex: AbelFluxIA)')
 
     args = parser.parse_args()
 
