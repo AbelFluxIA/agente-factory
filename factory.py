@@ -142,31 +142,47 @@ def generate_prompts(cfg: dict) -> str:
     regras_str = '\n'.join(f'- {r}' for r in regras)
     intents_str = ', '.join(e['intent'] for e in etapas)
 
+    estrutura = cfg.get('estrutura_prompt', '').strip()
+    estrutura_block = f'\n\n# ESTRUTURA DO PROMPT\n{estrutura}' if estrutura else ''
+
     return dedent(f'''\
     """Prompts e personalidade do agente {nome}."""
 
-    SYSTEM_PROMPT = """
-    {cfg["prompt_personalidade"].strip()}
-    """
+    SYSTEM_PROMPT = """{cfg["prompt_personalidade"].strip()}{estrutura_block}"""
 
     INTENT_CLASSIFIER_PROMPT = """
-    Você é um classificador de intenção. Analise a mensagem do usuário e classifique em uma das categorias:
-    {intents_str}, FORA_ESCOPO
-
+    Classifique a mensagem do usuário em uma das categorias: {intents_str}, FORA_ESCOPO
     Retorne APENAS o nome da categoria, sem explicação.
+    Mensagem: {{message}}
     """
 
-    GUARDRAILS_PROMPT = """
-    Verifique se a resposta abaixo viola alguma das regras. Se violar, corrija ou recuse.
+    HUMANIZER_SYSTEM_PROMPT = """# SUA FUNÇÃO
+    Você é {nome} respondendo pessoalmente no WhatsApp. Reescreva a mensagem-base como se fosse um ser humano real digitando agora.
 
-    REGRAS:
+    # REGRAS
+    1. PRESERVE O CONTEÚDO — não invente informações além do que está escrito.
+    2. QUEBRE EM MENSAGENS CURTAS — máximo 2-3 frases por bloco. Use ||| para separar blocos (cada ||| vira uma mensagem separada com delay entre elas).
+    3. SEM ELOGIOS VAZIOS — nunca "Perfeito!", "Incrível!", "Que ótimo!". Seja genuíno.
+    4. PRESERVE PERGUNTAS — se termina com pergunta, preserve-a exatamente.
+    5. SEM TRAVESSÃO (—) — use ponto final, vírgula, ou quebre com |||.
+    6. EMOJIS — no máximo 1 em toda a resposta. Prefira zero.
+
+    # COMO HUMANO ESCREVE NO WHATSAPP
+    - Varia como começa cada resposta. Nunca inicie dois blocos com a mesma palavra.
+    - Usa conectores naturais: "olha", "sabe", "é que", "então", "a questão é"
+    - Às vezes começa com o ponto principal direto, sem prefácio
+    - Usa reticências (...) quando há pausa natural de pensamento
+
+    # SAÍDA
+    Apenas o texto final com ||| onde houver quebras. Sem explicações."""
+
+    GUARDRAIL_CHECK_PROMPT = """Verifique se a resposta abaixo viola alguma das regras:
     {regras_str}
 
-    Resposta a verificar: {{response}}
+    Resposta a verificar: {{draft_response}}
 
-    Se OK: retorne a resposta original.
-    Se violar: corrija ou responda "Desculpe, não posso ajudar com isso."
-    """
+    Se violar: responda VIOLATION: [motivo]
+    Se estiver ok: responda OK"""
 
     # Respostas padrão por intenção
     DEFAULT_RESPONSES = {{
@@ -177,20 +193,41 @@ def generate_prompts(cfg: dict) -> str:
 def generate_state(cfg: dict) -> str:
     return dedent(f'''\
     """Estado da conversa do agente {cfg["nome"]}."""
-    from typing import TypedDict, Annotated, List, Optional
-    import operator
+    from typing import Annotated, Literal, Optional
+    from dataclasses import dataclass, field
+    from langchain_core.messages import BaseMessage
+    from langgraph.graph.message import add_messages
 
-    class ConversationState(TypedDict):
-        messages: Annotated[List[dict], operator.add]
-        phone: str
-        user_name: Optional[str]
-        current_intent: Optional[str]
-        intent_history: List[str]
-        stage: str  # nurturing | closing | closed
-        context: dict  # dados coletados durante o atendimento (ex: procedimento escolhido)
-        response: Optional[str]
-        should_send: bool
-        error: Optional[str]
+    Stage = Literal["nurturing", "qualifying", "closing", "closed", "escalated"]
+
+    @dataclass
+    class ConversationState:
+        phone: str = ""
+        messages: Annotated[list[BaseMessage], add_messages] = field(default_factory=list)
+
+        # Dados extraídos durante o atendimento
+        user_name: str = ""
+        context: dict = field(default_factory=dict)
+
+        # Intenção classificada pelo LLM
+        current_intent: str = ""
+        intent_history: list[str] = field(default_factory=list)
+
+        # Funil de vendas
+        stage: Stage = "nurturing"
+
+        # Decisão do agente
+        draft_response: str = ""
+
+        # Mensagens a enviar (pode ser múltiplas com delays entre elas)
+        # Use ||| no draft_response para gerar múltiplas mensagens
+        messages_to_send: list[str] = field(default_factory=list)
+        message_delays: list[int] = field(default_factory=list)
+
+        # Flags
+        guardrail_triggered: bool = False
+        notify_operator: bool = False
+        error: Optional[str] = None
     ''')
 
 def generate_nodes(cfg: dict) -> str:
@@ -210,78 +247,129 @@ def generate_nodes(cfg: dict) -> str:
     return dedent(f'''\
     """Nós de processamento do agente {nome}."""
     import json
+    from langchain_core.messages import HumanMessage, AIMessage
     from langchain_openai import ChatOpenAI
     from .state import ConversationState
-    from ..personality.prompts import SYSTEM_PROMPT, INTENT_CLASSIFIER_PROMPT, GUARDRAILS_PROMPT, DEFAULT_RESPONSES
+    from ..personality.prompts import (
+        SYSTEM_PROMPT, INTENT_CLASSIFIER_PROMPT,
+        HUMANIZER_SYSTEM_PROMPT, GUARDRAIL_CHECK_PROMPT, DEFAULT_RESPONSES,
+    )
     from ..services.apis import {", ".join(slugify(a["nome"]) + "_client" for a in apis) if apis else "# nenhuma API configurada"}
 
-    llm = ChatOpenAI(model="{cfg.get("llm_model", "gpt-4o-mini")}")
+    _llm_fast = ChatOpenAI(model="{cfg.get("llm_model", "gpt-4o-mini")}", temperature=0.3)
+    _llm_creative = ChatOpenAI(model="{cfg.get("llm_model", "gpt-4o-mini")}", temperature=0.8)
 
 
-    async def validate_message(state: ConversationState) -> ConversationState:
-        """Filtra mensagens inválidas, duplicadas ou de bots."""
-        if not state["messages"] or not state["messages"][-1].get("content", "").strip():
-            return {{**state, "should_send": False}}
-        return state
-
-
-    async def load_context(state: ConversationState) -> ConversationState:
-        """Carrega contexto da sessão (Redis) e histórico (PostgreSQL)."""
-        # Implementado em memory/redis_memory.py
-        return state
+    def _history_text(state: ConversationState) -> str:
+        lines = []
+        for m in state.messages[-20:]:
+            if isinstance(m, HumanMessage):
+                lines.append(f"Lead: {{m.content}}")
+            elif isinstance(m, AIMessage):
+                lines.append(f"Agente: {{m.content}}")
+        return "\\n".join(lines) or "(início da conversa)"
 
 
     async def classify_intent(state: ConversationState) -> ConversationState:
         """Classifica a intenção da última mensagem."""
-        last_msg = state["messages"][-1]["content"]
-        response = await llm.ainvoke(
-            INTENT_CLASSIFIER_PROMPT + f"\\nMensagem: {{last_msg}}"
+        last_msg = next((m.content for m in reversed(state.messages) if isinstance(m, HumanMessage)), "")
+        resp = await _llm_fast.ainvoke(
+            INTENT_CLASSIFIER_PROMPT.format(message=last_msg)
         )
-        intent = response.content.strip()
-        return {{
-            **state,
-            "current_intent": intent,
-            "intent_history": state.get("intent_history", []) + [intent],
-        }}
+        intent = resp.content.strip().upper()
+        state.current_intent = intent
+        state.intent_history = state.intent_history + [intent]
+        return state
 
 
     {intent_blocks}
 
     async def handle_fora_escopo(state: ConversationState) -> ConversationState:
-        """Redireciona tópicos fora do escopo."""
-        return {{**state, "response": "Hmm, esse assunto foge um pouco do meu escopo. Posso te ajudar com outra coisa?"}}
+        """Responde tópicos fora do escopo sem sair do personagem."""
+        state.draft_response = "Esse assunto foge um pouco do meu escopo por aqui. Posso te ajudar com outra coisa?"
+        return state
 
 
     async def generate_response(state: ConversationState) -> ConversationState:
-        """Gera resposta humanizada com LLM usando a personalidade do agente."""
-        history = "\\n".join(f'{{m["role"]}}: {{m["content"]}}' for m in state["messages"][-10:])
-        base = state.get("response", "")
-        prompt = f"{{SYSTEM_PROMPT}}\\n\\nHistórico:\\n{{history}}\\n\\nBase da resposta: {{base}}\\n\\nResponda de forma natural e humanizada:"
-        response = await llm.ainvoke(prompt)
-        return {{**state, "response": response.content}}
+        """Gera rascunho da resposta com o LLM usando o system prompt do agente."""
+        history = _history_text(state)
+        base = DEFAULT_RESPONSES.get(state.current_intent, "")
+        prompt = (
+            f"{{SYSTEM_PROMPT}}\\n\\n"
+            f"Histórico:\\n{{history}}\\n\\n"
+            f"Resposta base sugerida: {{base}}\\n\\n"
+            f"Escreva a resposta final. Use ||| para separar em múltiplas mensagens se necessário."
+        )
+        resp = await _llm_creative.ainvoke([HumanMessage(content=prompt)])
+        state.draft_response = resp.content.strip()
+        return state
+
+
+    async def humanize_response(state: ConversationState) -> ConversationState:
+        """Passa o rascunho pelo humanizador — quebra em mensagens curtas com |||."""
+        if not state.draft_response:
+            return state
+
+        # Se já tem |||, usa direto sem reprocessar
+        if "|||" in state.draft_response:
+            parts = [p.strip() for p in state.draft_response.split("|||") if p.strip()]
+            state.messages_to_send = parts
+            state.message_delays = [0] + [3] * (len(parts) - 1)
+            return state
+
+        resp = await _llm_creative.ainvoke([
+            {{"role": "system", "content": HUMANIZER_SYSTEM_PROMPT}},
+            {{"role": "user", "content": f"Transforme mantendo o sentido:\\n\\n{{state.draft_response}}"}},
+        ])
+        humanized = resp.content.strip()
+        parts = [p.strip() for p in humanized.split("|||") if p.strip()]
+        if not parts:
+            parts = [state.draft_response]
+
+        state.messages_to_send = parts
+        # Primeiro delay mínimo 2s (simula digitação), demais 3s
+        state.message_delays = [2] + [3] * (len(parts) - 1)
+        return state
 
 
     async def apply_guardrails(state: ConversationState) -> ConversationState:
-        """Verifica guardrails antes de enviar."""
-        check = await llm.ainvoke(GUARDRAILS_PROMPT.format(response=state["response"]))
-        return {{**state, "response": check.content, "should_send": True}}
+        """Verifica se alguma mensagem viola as regras antes de enviar."""
+        if not state.messages_to_send:
+            return state
+        full_text = " ".join(state.messages_to_send)
+        check = await _llm_fast.ainvoke(
+            GUARDRAIL_CHECK_PROMPT.format(draft_response=full_text)
+        )
+        if str(check.content).strip().startswith("VIOLATION"):
+            state.guardrail_triggered = True
+            state.messages_to_send = ["Desculpe, não consigo ajudar com isso agora."]
+            state.message_delays = [0]
+        return state
 
 
     async def send_message(state: ConversationState) -> ConversationState:
-        """Envia mensagem via WhatsApp."""
-        from ..services.whatsapp import send_whatsapp_message
-        if state.get("should_send") and state.get("response"):
-            await send_whatsapp_message(state["phone"], state["response"])
+        """Envia mensagens via WhatsApp com delays entre elas."""
+        from ..services.whatsapp import send_messages_sequence, mark_as_read
+        if state.messages_to_send:
+            import asyncio
+            asyncio.create_task(
+                send_messages_sequence(state.phone, state.messages_to_send, state.message_delays)
+            )
         return state
 
 
     async def persist_history(state: ConversationState) -> ConversationState:
-        """Persiste histórico no Redis e PostgreSQL."""
-        # Implementado em memory/
+        """Persiste histórico no Redis."""
+        from ..memory.redis_memory import redis_memory
+        combined = " | ".join(state.messages_to_send)
+        if state.messages and isinstance(state.messages[-1], HumanMessage):
+            await redis_memory.save_message(state.phone, "user", state.messages[-1].content)
+        if combined:
+            await redis_memory.save_message(state.phone, "assistant", combined)
         return state
 
 
-    # Ferramentas disponíveis via APIs:
+    # APIs disponíveis:
     {tools_block if tools_block else "    # Nenhuma API externa configurada"}
     ''')
 
@@ -289,8 +377,8 @@ def generate_graph(cfg: dict) -> str:
     etapas = cfg.get('etapas', [])
     intents = [e['intent'] for e in etapas]
     node_imports = ', '.join([
-        'validate_message', 'load_context', 'classify_intent',
-        'generate_response', 'apply_guardrails', 'send_message', 'persist_history',
+        'classify_intent', 'generate_response', 'humanize_response',
+        'apply_guardrails', 'send_message', 'persist_history',
         'handle_fora_escopo',
     ] + [f'handle_{i.lower()}' for i in intents])
 
@@ -316,41 +404,36 @@ def generate_graph(cfg: dict) -> str:
 
 
     def route_by_intent(state: ConversationState) -> str:
-        intent = state.get("current_intent", "FORA_ESCOPO")
         routes = {{
             {routing_cases}
             "FORA_ESCOPO": "handle_fora_escopo",
         }}
-        return routes.get(intent, "handle_fora_escopo")
+        return routes.get(state.current_intent, "handle_fora_escopo")
 
 
     def build_graph():
         graph = StateGraph(ConversationState)
 
-        # Nós fixos do pipeline
-        graph.add_node("validate_message", validate_message)
-        graph.add_node("load_context", load_context)
+        # Pipeline principal
         graph.add_node("classify_intent", classify_intent)
         graph.add_node("generate_response", generate_response)
+        graph.add_node("humanize_response", humanize_response)
         graph.add_node("apply_guardrails", apply_guardrails)
         graph.add_node("send_message", send_message)
         graph.add_node("persist_history", persist_history)
         graph.add_node("handle_fora_escopo", handle_fora_escopo)
 
-        # Nós de intenção (gerados a partir da config)
+        # Nós de intenção
     {node_registrations}
 
-        # Fluxo principal
-        graph.set_entry_point("validate_message")
-        graph.add_edge("validate_message", "load_context")
-        graph.add_edge("load_context", "classify_intent")
+        # Fluxo: classify → roteamento → generate → humanize → guardrails → send → persist
+        graph.set_entry_point("classify_intent")
         graph.add_conditional_edges("classify_intent", route_by_intent)
 
-        # Cada intenção → generate_response
     {edges_from_routing}
         graph.add_edge("handle_fora_escopo", "generate_response")
-
-        graph.add_edge("generate_response", "apply_guardrails")
+        graph.add_edge("generate_response", "humanize_response")
+        graph.add_edge("humanize_response", "apply_guardrails")
         graph.add_edge("apply_guardrails", "send_message")
         graph.add_edge("send_message", "persist_history")
         graph.add_edge("persist_history", END)
@@ -599,53 +682,163 @@ def generate_main(cfg: dict) -> str:
     ''')
 
 def generate_webhooks(cfg: dict) -> str:
+    nome = cfg['nome']
     return dedent(f'''\
-    """Webhook FastAPI — recebe mensagens do WhatsApp."""
-    import hmac, hashlib, os
-    from fastapi import APIRouter, Request, HTTPException
+    """Webhook FastAPI — recebe mensagens do WhatsApp com debounce."""
+    import asyncio
+    import hmac
+    import hashlib
+    import os
+    import re
+    from fastapi import APIRouter, Request, Response, HTTPException, Query, Body
+    from langchain_core.messages import HumanMessage
+
     from ..agent.graph import agent
     from ..agent.state import ConversationState
-    from ..services.whatsapp import parse_incoming
+    from ..memory.redis_memory import redis_memory
+    from ..services.whatsapp import (
+        parse_incoming, send_messages_sequence, mark_as_read,
+    )
 
     router = APIRouter(prefix="/webhook")
 
+    # Janela de debounce: aguarda X segundos de silêncio antes de processar.
+    # Isso acumula mensagens quebradas do cliente em um único texto.
+    DEBOUNCE_SECONDS = 5
+
+    # Geração por telefone — cancela timers antigos se chegar nova mensagem
+    _debounce_gen: dict[str, int] = {{}}
+
+    # Mensagens que são só símbolos (cliente respondia uma mensagem com ".")
+    _ONLY_SYMBOLS = re.compile(r"^[^\\w]+$")
+
+    # Saudações que indicam conversa nova
+    _GREETINGS = {{
+        "oi", "oi!", "olá", "olá!", "ola", "hello", "hi",
+        "bom dia", "boa tarde", "boa noite",
+    }}
+
 
     @router.get("/whatsapp")
-    async def verify(hub_mode: str, hub_verify_token: str, hub_challenge: str):
+    async def verify_webhook(
+        hub_mode: str = Query(alias="hub.mode", default=""),
+        hub_verify_token: str = Query(alias="hub.verify_token", default=""),
+        hub_challenge: str = Query(alias="hub.challenge", default=""),
+    ) -> Response:
         if hub_mode == "subscribe" and hub_verify_token == os.environ["WHATSAPP_VERIFY_TOKEN"]:
-            return int(hub_challenge)
-        raise HTTPException(status_code=403)
+            return Response(content=hub_challenge, media_type="text/plain")
+        raise HTTPException(status_code=403, detail="Verificação falhou")
 
 
     @router.post("/whatsapp")
-    async def receive(request: Request):
-        payload = await request.body()
+    async def receive_message(request: Request) -> dict:
+        """Recebe evento, valida assinatura, acumula no buffer e agenda debounce."""
+        raw_body = await request.body()
         sig = request.headers.get("x-hub-signature-256", "")
         secret = os.environ.get("WHATSAPP_APP_SECRET", "")
         if secret:
-            expected = "sha256=" + hmac.new(secret.encode(), payload, hashlib.sha256).hexdigest()
+            expected = "sha256=" + hmac.new(secret.encode(), raw_body, hashlib.sha256).hexdigest()
             if not hmac.compare_digest(expected, sig):
-                raise HTTPException(status_code=403)
+                raise HTTPException(status_code=401, detail="Assinatura inválida")
 
-        msg = parse_incoming(await request.json())
-        if not msg:
+        payload = await request.json()
+        try:
+            changes = payload["entry"][0]["changes"][0]["value"]
+            messages = changes.get("messages", [])
+        except (KeyError, IndexError):
+            return {{"status": "no_messages"}}
+
+        if not messages:
+            return {{"status": "no_messages"}}
+
+        message = messages[0]
+        phone = message["from"]
+        message_id = message["id"]
+        message_type = message.get("type", "")
+
+        if message_type == "text":
+            user_text = message["text"]["body"]
+        else:
+            # Outros tipos (imagem, sticker, etc.) são ignorados por padrão
             return {{"status": "ignored"}}
 
-        initial_state = ConversationState(
-            messages=[{{"role": "user", "content": msg["text"]}}],
-            phone=msg["phone"],
-            user_name=msg.get("name"),
-            current_intent=None,
-            intent_history=[],
-            stage="nurturing",
-            context={{}},
-            response=None,
-            should_send=False,
-            error=None,
+        await mark_as_read(message_id)
+
+        # Resolve quoted reply com símbolo: lead respondeu uma msg com "."
+        context_obj = message.get("context", {{}})
+        quoted_wamid = context_obj.get("id", "")
+        if quoted_wamid and (len(user_text.strip()) <= 2 or _ONLY_SYMBOLS.match(user_text.strip())):
+            original = await redis_memory.get_wamid(quoted_wamid)
+            if original:
+                user_text = original
+
+        await redis_memory.save_wamid(message_id, user_text)
+        await redis_memory.buffer_message(phone, user_text)
+
+        gen = _debounce_gen.get(phone, 0) + 1
+        _debounce_gen[phone] = gen
+        asyncio.create_task(_debounced_process(phone, gen))
+
+        return {{"status": "ok"}}
+
+
+    async def _debounced_process(phone: str, gen: int) -> None:
+        """Aguarda silêncio e processa todas as mensagens acumuladas como uma só."""
+        await asyncio.sleep(DEBOUNCE_SECONDS)
+
+        if _debounce_gen.get(phone) != gen:
+            return  # chegou mensagem mais nova, ela vai processar
+
+        buffered = await redis_memory.flush_buffer(phone)
+        if not buffered:
+            return
+
+        # Combina todas as mensagens quebradas em um único texto
+        combined_text = "\\n".join(buffered)
+
+        history = await redis_memory.load_messages(phone)
+        session = await redis_memory.load_session(phone)
+
+        # Auto-reset: saudação em sessão avançada = lead recomeçando
+        step = session.get("current_step", 1)
+        if step > 1 and combined_text.strip().lower().rstrip("!") in _GREETINGS:
+            await redis_memory.reset_session(phone)
+            session = {{}}
+            history = []
+
+        state = ConversationState(
+            phone=phone,
+            messages=history + [HumanMessage(content=combined_text)],
+            stage=session.get("stage", "nurturing"),
+            user_name=session.get("user_name", ""),
+            context=session.get("context", {{}}),
         )
 
-        await agent.ainvoke(initial_state)
-        return {{"status": "processed"}}
+        raw = await agent.ainvoke(state)
+
+        messages_to_send: list[str] = raw.get("messages_to_send") or []
+        message_delays: list[int] = raw.get("message_delays") or []
+
+        if messages_to_send:
+            # Garante mínimo de 2s no primeiro (simula digitação)
+            if message_delays:
+                message_delays[0] = max(message_delays[0], 2)
+            asyncio.create_task(send_messages_sequence(phone, messages_to_send, message_delays))
+
+        await redis_memory.save_session(phone, {{
+            "stage": raw.get("stage", "nurturing"),
+            "current_step": raw.get("current_step", step),
+            "user_name": raw.get("user_name", ""),
+            "context": raw.get("context", {{}}),
+        }})
+
+
+    @router.post("/reset-session")
+    async def reset_session_endpoint(phone: str = Body(..., embed=True)) -> dict:
+        """Reseta sessão Redis de um número (chamado ao reiniciar conversa no Zynk)."""
+        await redis_memory.reset_session(phone)
+        _debounce_gen.pop(phone, None)
+        return {{"status": "reset"}}
     ''')
 
 # ─── CLI ─────────────────────────────────────────────────────────────────────
@@ -785,61 +978,206 @@ def push_to_github(output_dir: Path, nome: str, github_owner: str, private: bool
 
 
 def _copy_base_services(output_dir: Path, nome: str):
-    """Copia serviços base (whatsapp.py, memory/) da estrutura padrão."""
+    """Gera serviços base com as técnicas da Vanessa IA."""
     whatsapp_content = dedent('''\
-    """Cliente Meta Business API."""
-    import os, httpx
+    """Cliente Meta Business API — envia mensagens com delays e suporte a imagens."""
+    import asyncio
+    import hmac
+    import hashlib
+    import os
+    import httpx
 
-    BASE_URL = "https://graph.facebook.com/v19.0"
+    BASE_URL = "https://graph.facebook.com/v21.0"
 
-    async def send_whatsapp_message(phone: str, text: str) -> dict:
+
+    def verify_signature(payload: bytes, signature: str) -> bool:
+        secret = os.environ.get("WHATSAPP_APP_SECRET", "")
+        if not secret:
+            return True
+        expected = "sha256=" + hmac.new(secret.encode(), payload, hashlib.sha256).hexdigest()
+        return hmac.compare_digest(expected, signature)
+
+
+    async def send_text_message(to: str, text: str) -> bool:
         token = os.environ["WHATSAPP_ACCESS_TOKEN"]
         phone_id = os.environ["WHATSAPP_PHONE_NUMBER_ID"]
-        async with httpx.AsyncClient() as client:
+        async with httpx.AsyncClient(timeout=30) as client:
             resp = await client.post(
                 f"{BASE_URL}/{phone_id}/messages",
-                headers={"Authorization": f"Bearer {token}"},
-                json={"messaging_product": "whatsapp", "to": phone, "type": "text", "text": {"body": text}},
+                headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
+                json={
+                    "messaging_product": "whatsapp",
+                    "recipient_type": "individual",
+                    "to": to,
+                    "type": "text",
+                    "text": {"body": text, "preview_url": False},
+                },
             )
-            resp.raise_for_status()
-            return resp.json()
+        return resp.status_code == 200
+
+
+    async def send_image_message(to: str, image_url: str) -> bool:
+        token = os.environ["WHATSAPP_ACCESS_TOKEN"]
+        phone_id = os.environ["WHATSAPP_PHONE_NUMBER_ID"]
+        async with httpx.AsyncClient(timeout=30) as client:
+            resp = await client.post(
+                f"{BASE_URL}/{phone_id}/messages",
+                headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
+                json={
+                    "messaging_product": "whatsapp",
+                    "to": to,
+                    "type": "image",
+                    "image": {"link": image_url},
+                },
+            )
+        return resp.status_code == 200
+
+
+    async def send_messages_sequence(to: str, texts: list[str], delays: list[int]) -> None:
+        """Envia múltiplas mensagens com delay entre elas.
+        Suporta [IMAGE:url] para enviar imagens inline na sequência.
+        """
+        for delay, text in zip(delays, texts):
+            if delay > 0:
+                await asyncio.sleep(delay)
+            if text.startswith("[IMAGE:") and text.endswith("]"):
+                await send_image_message(to, text[7:-1])
+            else:
+                await send_text_message(to, text)
+
+
+    async def mark_as_read(message_id: str) -> None:
+        """Marca mensagem como lida (duplo check azul)."""
+        token = os.environ["WHATSAPP_ACCESS_TOKEN"]
+        phone_id = os.environ["WHATSAPP_PHONE_NUMBER_ID"]
+        async with httpx.AsyncClient(timeout=10) as client:
+            await client.post(
+                f"{BASE_URL}/{phone_id}/messages",
+                headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
+                json={"messaging_product": "whatsapp", "status": "read", "message_id": message_id},
+            )
+
+
+    async def notify_operator(phone: str, message: str) -> None:
+        """Notifica o número do operador/dono sobre evento importante."""
+        operator_phone = os.environ.get("OPERATOR_NOTIFICATION_PHONE", "")
+        if operator_phone:
+            await send_text_message(operator_phone, message)
+
 
     def parse_incoming(body: dict) -> dict | None:
+        """Extrai dados da mensagem recebida. Retorna None para eventos sem mensagem."""
         try:
             entry = body["entry"][0]["changes"][0]["value"]
             msg = entry["messages"][0]
             contact = entry["contacts"][0]
             return {
                 "phone": msg["from"],
-                "name": contact["profile"]["name"],
+                "name": contact["profile"].get("name", ""),
                 "text": msg.get("text", {}).get("body", ""),
                 "message_id": msg["id"],
+                "type": msg.get("type", "text"),
             }
         except (KeyError, IndexError):
             return None
     ''')
 
     redis_content = dedent('''\
-    """Memória de sessão via Redis."""
-    import json, os
-    from redis.asyncio import from_url
+    """Memória de sessão via Redis — buffer de debounce, histórico e estado."""
+    import json
+    import os
+    from typing import Optional
+    import redis.asyncio as aioredis
+    from langchain_core.messages import HumanMessage, AIMessage, BaseMessage
 
-    redis = None
+    SESSION_TTL = int(os.environ.get("REDIS_SESSION_TTL", 86400))  # 24h = janela WhatsApp
 
-    async def get_redis():
-        global redis
-        if redis is None:
-            redis = await from_url(os.environ["REDIS_URL"], decode_responses=True)
-        return redis
 
-    async def load_session(phone: str) -> dict:
-        r = await get_redis()
-        data = await r.get(f"session:{phone}")
-        return json.loads(data) if data else {}
+    class RedisMemory:
+        def __init__(self) -> None:
+            self._client: Optional[aioredis.Redis] = None
 
-    async def save_session(phone: str, data: dict, ttl: int = 86400):
-        r = await get_redis()
-        await r.setex(f"session:{phone}", ttl, json.dumps(data))
+        async def client(self) -> aioredis.Redis:
+            if self._client is None:
+                self._client = await aioredis.from_url(
+                    os.environ["REDIS_URL"], encoding="utf-8", decode_responses=True
+                )
+            return self._client
+
+        def _key(self, phone: str) -> str:
+            return f"session:{phone}"
+
+        async def load_messages(self, phone: str) -> list[BaseMessage]:
+            r = await self.client()
+            raw = await r.get(self._key(phone))
+            if not raw:
+                return []
+            data = json.loads(raw)
+            result: list[BaseMessage] = []
+            for m in data.get("messages", []):
+                if m["role"] == "user":
+                    result.append(HumanMessage(content=m["content"]))
+                else:
+                    result.append(AIMessage(content=m["content"]))
+            return result
+
+        async def load_session(self, phone: str) -> dict:
+            r = await self.client()
+            raw = await r.get(self._key(phone))
+            if not raw:
+                return {}
+            data = json.loads(raw)
+            return {k: v for k, v in data.items() if k != "messages"}
+
+        async def save_message(self, phone: str, role: str, content: str) -> None:
+            r = await self.client()
+            raw = await r.get(self._key(phone))
+            data = json.loads(raw) if raw else {"messages": []}
+            data.setdefault("messages", [])
+            data["messages"].append({"role": role, "content": content})
+            data["messages"] = data["messages"][-40:]  # mantém últimas 40 mensagens
+            await r.setex(self._key(phone), SESSION_TTL, json.dumps(data))
+
+        async def save_session(self, phone: str, fields: dict) -> None:
+            r = await self.client()
+            raw = await r.get(self._key(phone))
+            data = json.loads(raw) if raw else {"messages": []}
+            data.update(fields)
+            await r.setex(self._key(phone), SESSION_TTL, json.dumps(data))
+
+        async def reset_session(self, phone: str) -> None:
+            r = await self.client()
+            await r.delete(self._key(phone))
+            await r.delete(f"msgbuf:{phone}")
+
+        # ── Debounce buffer ──────────────────────────────────────────────────
+        # Acumula mensagens quebradas do cliente antes de processar
+
+        async def buffer_message(self, phone: str, text: str) -> None:
+            r = await self.client()
+            await r.rpush(f"msgbuf:{phone}", text)
+            await r.expire(f"msgbuf:{phone}", 30)
+
+        async def flush_buffer(self, phone: str) -> list[str]:
+            r = await self.client()
+            key = f"msgbuf:{phone}"
+            msgs = await r.lrange(key, 0, -1)
+            await r.delete(key)
+            return msgs or []
+
+        # ── Quoted reply lookup ──────────────────────────────────────────────
+        # Resolve quando o lead responde uma mensagem com "."
+
+        async def save_wamid(self, wamid: str, text: str) -> None:
+            r = await self.client()
+            await r.setex(f"wamid:{wamid}", 86400, text)
+
+        async def get_wamid(self, wamid: str) -> str | None:
+            r = await self.client()
+            return await r.get(f"wamid:{wamid}")
+
+
+    redis_memory = RedisMemory()
     ''')
 
     (output_dir / f'src/{nome}/services/whatsapp.py').write_text(whatsapp_content)
