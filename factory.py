@@ -38,62 +38,118 @@ REQUIRED_FIELDS = ['nome', 'descricao', 'prompt_personalidade', 'etapas', 'regra
 
 EXAMPLE_CONFIG = """\
 # ─────────────────────────────────────────────────────────────────────────────
-# Configuração do Agente
+# Configuração do Agente — Agente Factory
 # ─────────────────────────────────────────────────────────────────────────────
 
-# Identidade
-nome: meu_agente          # slug sem espaços (usado nos arquivos gerados)
+nome: clinica_bella
 descricao: "Agente de vendas para clínica de estética"
 cliente: "Clínica Bella"
 
-# ─── Prompt de personalidade ─────────────────────────────────────────────────
-# Descreva quem é o agente, tom de voz, como fala, o que NÃO faz
+# ─── Personalidade ───────────────────────────────────────────────────────────
+# Quem é o agente, tom de voz, o que faz e o que NÃO faz
 prompt_personalidade: |
-  Você é Sofia, consultora de vendas da Clínica Bella.
-  Fale de forma calorosa, próxima e profissional.
-  Você ajuda clientes a agendar procedimentos estéticos.
+  Você é Sofia, consultora da Clínica Bella.
+  Tom caloroso, próximo e profissional — como uma amiga especialista.
+  Você ajuda clientes a conhecer e agendar procedimentos estéticos.
   Nunca prometa resultados garantidos.
   Nunca fale mal de concorrentes.
+  Nunca discuta política, religião ou saúde geral.
 
 # ─── Etapas de atendimento ───────────────────────────────────────────────────
-# Cada etapa vira um nó no grafo LangGraph
-# intent: identificador interno
-# label: nome amigável
-# descricao: o que acontece nessa etapa
-# resposta_padrao: mensagem base (pode ser personalizada pelo LLM)
+# passo: número sequencial (auto-numerado se omitido)
+# regras: instruções em linguagem natural para o LLM neste passo
 etapas:
-  - intent: INTERESSE_INICIAL
-    label: "Primeiro contato"
-    descricao: "Lead acabou de entrar em contato pela primeira vez"
-    resposta_padrao: "Olá! Tudo bem? Sou a Sofia da Clínica Bella. Como posso te ajudar hoje?"
+  - passo: 1
+    intent: CAPTURA_NOME
+    label: "Capturar nome"
+    descricao: "Saudar e capturar o primeiro nome do lead"
+    regras: |
+      SE é o primeiro contato (histórico vazio):
+        Envie EXATAMENTE: "Olá! Sou a Sofia da Clínica Bella. Me conta seu nome pra gente continuar?"
+        action: converse, next_step: 1
+      SE lead informou um nome:
+        Extraia em extracted_nome.
+        action: converse, next_step: 2
+        Resposta: "{nome}, que bom ter você aqui! É sua primeira vez na Clínica Bella?"
+    resposta_padrao: "Olá! Sou a Sofia da Clínica Bella. Me conta seu nome pra gente continuar?"
 
-  - intent: DUVIDA_PROCEDIMENTO
-    label: "Dúvida sobre procedimento"
-    descricao: "Lead pergunta sobre um procedimento específico"
-    resposta_padrao: "Ótima pergunta! Vou te explicar tudo sobre esse procedimento..."
+  - passo: 2
+    intent: QUALIFICACAO
+    label: "Qualificar interesse"
+    descricao: "Entender o que o lead busca"
+    regras: |
+      SE lead é cliente existente: direcione para atendimento especializado. action: transferir
+      SE lead mencionou procedimento: extraia em extracted_interesse, avance passo 3.
+      SE vago: "Você tá buscando algo mais para rosto, corpo ou bem-estar?"
+    resposta_padrao: "É sua primeira vez conosco? Me conta o que você tá buscando."
 
-  - intent: OBJECAO_PRECO
-    label: "Objeção de preço"
-    descricao: "Lead resistente ao valor do procedimento"
-    resposta_padrao: "Entendo sua preocupação com o investimento. Deixa eu te mostrar o custo-benefício..."
+  - passo: 3
+    intent: APRESENTACAO
+    label: "Apresentar solução"
+    descricao: "Conectar a dor do lead ao procedimento e apresentar o atendimento"
+    regras: |
+      Valide brevemente o interesse do lead.
+      Apresente o procedimento com foco no benefício, não na técnica.
+      Termine com: "Faz sentido pra você?"
+      action: converse, next_step: 4
+    resposta_padrao: "Olha, baseado no que você me contou, acho que temos exatamente o que você precisa..."
 
-  - intent: PRONTO_AGENDAR
-    label: "Pronto para agendar"
-    descricao: "Lead quer marcar horário"
-    resposta_padrao: "Que ótimo! Vamos verificar nossa agenda..."
+  - passo: 4
+    intent: FECHAMENTO
+    label: "Fechamento e agendamento"
+    descricao: "Conduzir para o agendamento ou pagamento"
+    regras: |
+      SE lead disse SIM: apresente as opções de pagamento/agendamento.
+      SE lead perguntou preço: informe valores e formas de pagamento.
+      SE lead mencionou forma de pagamento: extraia em payment_method, avance passo 5.
+      SE objeção no limite: ofereça alternativa mais acessível ou encerre graciosamente.
+    resposta_padrao: "Como você prefere prosseguir? Posso te mostrar as opções de agendamento."
 
-  - intent: ENCERRAMENTO
-    label: "Encerrando atendimento"
-    descricao: "Lead quer encerrar a conversa"
-    resposta_padrao: "Foi um prazer te atender! Qualquer dúvida, estou aqui."
+  - passo: 5
+    intent: CONFIRMACAO
+    label: "Confirmação final"
+    descricao: "Confirmar agendamento e notificar operador"
+    regras: |
+      Confirme os dados do agendamento.
+      Informe próximos passos (confirmação, o que trazer, etc.).
+      Defina notify_operator: true para alertar o time.
+      action: converse, next_step: 5
+    resposta_padrao: "Perfeito! Tudo confirmado. Em breve você vai receber a confirmação."
+
+# ─── Dados a extrair do lead ─────────────────────────────────────────────────
+dados_extrair:
+  - campo: extracted_nome
+    descricao: "Primeiro nome do lead"
+  - campo: extracted_interesse
+    descricao: "Procedimento ou área de interesse do lead"
+
+# ─── Formas de pagamento ─────────────────────────────────────────────────────
+formas_pagamento:
+  - pix
+  - cartao
+  - dinheiro
+
+# ─── Limite de objeções ──────────────────────────────────────────────────────
+max_objecoes: 2
+
+# ─── Vocabulário e humanização ───────────────────────────────────────────────
+vocabulario:
+  substituicoes:
+    problema: desafio
+    para: pra
+    ajuda: apoio
+  conectores:
+    - "olha"
+    - "sabe?"
+    - "então"
+    - "é que"
 
 # ─── APIs externas ────────────────────────────────────────────────────────────
-# Cada API vira uma ferramenta (tool) disponível para o agente
 apis:
   - nome: agenda
     descricao: "Sistema de agendamento da clínica"
-    url_env: AGENDA_API_URL       # nome da variável de ambiente com a URL
-    auth_env: AGENDA_API_KEY      # nome da variável de ambiente com a chave
+    url_env: AGENDA_API_URL
+    auth_env: AGENDA_API_KEY
     endpoints:
       - nome: verificar_disponibilidade
         metodo: GET
@@ -104,30 +160,18 @@ apis:
         path: /appointments
         descricao: "Cria um novo agendamento"
 
-  - nome: catalogo
-    descricao: "Catálogo de procedimentos e preços"
-    url_env: CATALOGO_API_URL
-    auth_env: CATALOGO_API_KEY
-    endpoints:
-      - nome: listar_procedimentos
-        metodo: GET
-        path: /procedures
-        descricao: "Lista todos os procedimentos disponíveis"
-
 # ─── Regras (guardrails) ──────────────────────────────────────────────────────
-# Verificações que o agente SEMPRE faz antes de enviar uma mensagem
 regras:
-  - "Nunca prometar resultado garantido de procedimento estético"
+  - "Nunca prometer resultado garantido de procedimento estético"
   - "Nunca compartilhar dados de outros clientes"
   - "Nunca mencionar concorrentes pelo nome"
-  - "Sempre manter tom profissional e respeitoso"
-  - "Se não souber a resposta, admitir e oferecer contato com atendente humano"
+  - "Nunca revelar que é uma IA"
 
 # ─── Configurações opcionais ──────────────────────────────────────────────────
-llm_model: "gpt-4o-mini"    # ou claude-3-5-haiku-20241022
+llm_model: "gpt-4o-mini"
 notificacao_fechamento:
   ativo: true
-  whatsapp: "5511999999999"  # número do dono para notificar ao fechar venda
+  whatsapp: "5511999999999"
 """
 
 # ─── Gerador de arquivos ─────────────────────────────────────────────────────
@@ -139,310 +183,414 @@ def generate_prompts(cfg: dict) -> str:
     nome = cfg['nome']
     etapas = cfg.get('etapas', [])
     regras = cfg.get('regras', [])
-    regras_str = '\n'.join(f'- {r}' for r in regras)
-    intents_str = ', '.join(e['intent'] for e in etapas)
+    dados_extrair = cfg.get('dados_extrair', [])
+    formas_pagamento = cfg.get('formas_pagamento', [])
+    max_objecoes = cfg.get('max_objecoes', 2)
+    vocabulario = cfg.get('vocabulario', {})
 
-    estrutura = cfg.get('estrutura_prompt', '').strip()
-    estrutura_block = f'\n\n# ESTRUTURA DO PROMPT\n{estrutura}' if estrutura else ''
+    # Auto-numerar etapas se passo não definido
+    for i, e in enumerate(etapas):
+        if 'passo' not in e:
+            e['passo'] = i + 1
+
+    regras_str = '\n'.join(f'- {r}' for r in regras)
+
+    # STEP_RULES dict entries
+    step_entries = []
+    for e in etapas:
+        passo = e['passo']
+        label = e['label']
+        descricao = e['descricao']
+        regras_passo = e.get('regras', f'Lide com esta etapa conforme o contexto: {descricao}').strip()
+        # indent the rules block
+        regras_indented = '\n'.join(f'    {line}' for line in regras_passo.splitlines())
+        step_entries.append(
+            f'    {passo}: """\nPASSO {passo} — {label}\n{descricao}\n\n{regras_indented}\n""",'
+        )
+    step_rules_block = '\n'.join(step_entries)
+
+    # Campos extraídos
+    campos = [d['campo'] for d in dados_extrair]
+    campos_repr = repr(campos)
+
+    # Formas de pagamento
+    formas_repr = repr(formas_pagamento)
+
+    # JSON schema para BRAIN_DECISION_PROMPT
+    dados_json_fields = '\n'.join(f'  "{d["campo"]}": "",' for d in dados_extrair)
+
+    # Vocabulário para humanizador
+    subs = vocabulario.get('substituicoes', {})
+    vocab_str = ', '.join(f'"{k}" -> "{v}"' for k, v in subs.items()) if subs else 'nenhuma configurada'
+    conectores = vocabulario.get('conectores', ['olha', 'sabe', 'então', 'é que', 'pensa comigo'])
+    conectores_str = ', '.join(f'"{c}"' for c in conectores)
 
     return dedent(f'''\
-    """Prompts e personalidade do agente {nome}."""
+"""Prompts e personalidade do agente {nome}."""
 
-    SYSTEM_PROMPT = """{cfg["prompt_personalidade"].strip()}{estrutura_block}"""
+SYSTEM_PROMPT = """{cfg["prompt_personalidade"].strip()}"""
 
-    INTENT_CLASSIFIER_PROMPT = """
-    Classifique a mensagem do usuário em uma das categorias: {intents_str}, FORA_ESCOPO
-    Retorne APENAS o nome da categoria, sem explicação.
-    Mensagem: {{message}}
-    """
+# Regras específicas por passo — geradas do YAML
+STEP_RULES: dict[int, str] = {{
+{step_rules_block}
+}}
 
-    HUMANIZER_SYSTEM_PROMPT = """# SUA FUNÇÃO
-    Você é {nome} respondendo pessoalmente no WhatsApp. Reescreva a mensagem-base como se fosse um ser humano real digitando agora.
+DADOS_EXTRAIR: list[str] = {campos_repr}
 
-    # REGRAS
-    1. PRESERVE O CONTEÚDO — não invente informações além do que está escrito.
-    2. QUEBRE EM MENSAGENS CURTAS — máximo 2-3 frases por bloco. Use ||| para separar blocos (cada ||| vira uma mensagem separada com delay entre elas).
-    3. SEM ELOGIOS VAZIOS — nunca "Perfeito!", "Incrível!", "Que ótimo!". Seja genuíno.
-    4. PRESERVE PERGUNTAS — se termina com pergunta, preserve-a exatamente.
-    5. SEM TRAVESSÃO (—) — use ponto final, vírgula, ou quebre com |||.
-    6. EMOJIS — no máximo 1 em toda a resposta. Prefira zero.
+FORMAS_PAGAMENTO: list[str] = {formas_repr}
 
-    # COMO HUMANO ESCREVE NO WHATSAPP
-    - Varia como começa cada resposta. Nunca inicie dois blocos com a mesma palavra.
-    - Usa conectores naturais: "olha", "sabe", "é que", "então", "a questão é"
-    - Às vezes começa com o ponto principal direto, sem prefácio
-    - Usa reticências (...) quando há pausa natural de pensamento
+MAX_OBJECOES: int = {max_objecoes}
 
-    # SAÍDA
-    Apenas o texto final com ||| onde houver quebras. Sem explicações."""
+BRAIN_DECISION_PROMPT = """
+Você é um agente de atendimento via WhatsApp. Analise o contexto e responda em JSON.
 
-    GUARDRAIL_CHECK_PROMPT = """Verifique se a resposta abaixo viola alguma das regras:
-    {regras_str}
+╔══════════════════════════════════════════════════════════════╗
+║  CAMADA 1 — LEITURA DO LEAD (avalie ANTES das regras)      ║
+╚══════════════════════════════════════════════════════════════╝
 
-    Resposta a verificar: {{draft_response}}
+A) SINAL DE COMPRA ANTECIPADO
+   Lead demonstrou intenção clara de fechar/comprar/agendar?
+   → Pule direto para o passo de fechamento
 
-    Se violar: responda VIOLATION: [motivo]
-    Se estiver ok: responda OK"""
+B) ESTADO EMOCIONAL
+   Lead está frustrado, empolgado ou confuso?
+   → Adapte o tom brevemente antes de prosseguir
 
-    # Respostas padrão por intenção
-    DEFAULT_RESPONSES = {{
-    {chr(10).join(f'    "{e["intent"]}": """{e["resposta_padrao"]}""",' for e in etapas)}
-    }}
-    ''')
+C) PERGUNTA TANGENCIAL (dentro do escopo, fora do fluxo)
+   → Responda em 1-2 frases e volte ao fluxo normalmente
+
+D) MENSAGEM VAGA OU MUITO CURTA
+   → Interprete pelo contexto do passo atual
+
+╔══════════════════════════════════════════════════════════════╗
+║  CAMADA 2 — REGRAS DO PASSO ATUAL                          ║
+╚══════════════════════════════════════════════════════════════╝
+
+Siga as regras do passo atual fornecidas no contexto dinâmico.
+
+╔══════════════════════════════════════════════════════════════╗
+║  FORMATO DE RESPOSTA — JSON OBRIGATÓRIO                    ║
+╚══════════════════════════════════════════════════════════════╝
+
+Responda APENAS JSON válido (sem markdown, sem explicações):
+{{{{
+  "action": "converse",
+  "response": "texto da resposta (use ||| para separar em blocos de mensagem)",
+  "next_step": 1,
+  "next_sub_state": "",
+  "increment_objection": false,
+  "notify_operator": false,
+  "payment_method": "",
+{dados_json_fields}
+}}}}
+
+REGRAS DO JSON:
+- "response": texto completo. Use ||| para enviar como múltiplas mensagens.
+- "next_step": só mude quando as regras indicarem avanço claro de passo.
+- "increment_objection": true APENAS para recusas/objeções explícitas.
+- "notify_operator": true quando lead fechar/confirmar (notifica o dono).
+- Campos de extração: preencha SOMENTE quando tiver certeza do valor.
+"""
+
+HUMANIZER_SYSTEM_PROMPT = """# SUA FUNÇÃO
+Você é um humano real respondendo no WhatsApp. Reescreva a mensagem de forma natural.
+
+# REGRAS
+1. PRESERVE O CONTEÚDO — não invente informações além do que está escrito.
+2. QUEBRE EM CURTAS — máximo 2-3 frases por bloco. Use ||| para separar blocos.
+3. SEM ELOGIOS VAZIOS — nunca "Perfeito!", "Incrível!", "Que ótimo!", "Claro!".
+4. PRESERVE PERGUNTAS — se termina com pergunta, preserve-a exatamente.
+5. SEM TRAVESSÃO (—) — use ponto final, vírgula ou quebre com |||.
+6. EMOJIS — máximo 1 em toda a resposta. Prefira zero.
+7. VOCABULÁRIO — substitua naturalmente: {vocab_str}
+
+# COMO HUMANO ESCREVE NO WHATSAPP
+- Varia o início de cada bloco. Nunca inicie dois blocos com a mesma palavra.
+- Conectores naturais: {conectores_str}
+- Às vezes começa com o ponto principal direto, sem prefácio.
+- Usa reticências (...) quando há pausa natural de pensamento.
+
+# SAÍDA
+Apenas o texto final com ||| onde houver quebras. Sem explicações."""
+
+GUARDRAIL_CHECK_PROMPT = """Verifique se a resposta viola alguma das regras:
+
+REGRAS:
+{regras_str}
+
+Resposta a verificar:
+{{draft_response}}
+
+Responda APENAS:
+- "OK" se não viola nenhuma regra
+- "VIOLATION: [motivo específico]" se violar
+
+Marque VIOLATION apenas para violações claras e inequívocas."""
+''')
 
 def generate_state(cfg: dict) -> str:
+    dados_extrair = cfg.get('dados_extrair', [])
+    extracted_fields = '\n'.join(
+        f'    {d["campo"]}: str = ""  # {d["descricao"]}'
+        for d in dados_extrair
+    )
+    if extracted_fields:
+        extracted_fields = '\n    # Dados extraídos do lead\n' + extracted_fields
+
     return dedent(f'''\
-    """Estado da conversa do agente {cfg["nome"]}."""
-    from typing import Annotated, Literal, Optional
-    from dataclasses import dataclass, field
-    from langchain_core.messages import BaseMessage
-    from langgraph.graph.message import add_messages
+"""Estado da conversa do agente {cfg["nome"]}."""
+from typing import Annotated, Literal, Optional
+from dataclasses import dataclass, field
+from langchain_core.messages import BaseMessage
+from langgraph.graph.message import add_messages
 
-    Stage = Literal["nurturing", "qualifying", "closing", "closed", "escalated"]
+Stage = Literal["nurturing", "qualifying", "closing", "closed", "escalated"]
 
-    @dataclass
-    class ConversationState:
-        phone: str = ""
-        messages: Annotated[list[BaseMessage], add_messages] = field(default_factory=list)
+@dataclass
+class ConversationState:
+    phone: str = ""
+    messages: Annotated[list[BaseMessage], add_messages] = field(default_factory=list)
 
-        # Dados extraídos durante o atendimento
-        user_name: str = ""
-        context: dict = field(default_factory=dict)
+    # Fluxo numerado por passos
+    current_step: int = 1
+    sub_state: str = ""
+    stage: Stage = "nurturing"
+{extracted_fields}
 
-        # Intenção classificada pelo LLM
-        current_intent: str = ""
-        intent_history: list[str] = field(default_factory=list)
+    # Tracking de vendas
+    objection_count: int = 0
+    payment_method: str = ""
 
-        # Funil de vendas
-        stage: Stage = "nurturing"
+    # Resposta gerada
+    draft_response: str = ""
+    messages_to_send: list[str] = field(default_factory=list)
+    message_delays: list[int] = field(default_factory=list)
 
-        # Decisão do agente
-        draft_response: str = ""
-
-        # Mensagens a enviar (pode ser múltiplas com delays entre elas)
-        # Use ||| no draft_response para gerar múltiplas mensagens
-        messages_to_send: list[str] = field(default_factory=list)
-        message_delays: list[int] = field(default_factory=list)
-
-        # Flags
-        guardrail_triggered: bool = False
-        notify_operator: bool = False
-        error: Optional[str] = None
-    ''')
+    # Flags
+    guardrail_triggered: bool = False
+    notify_operator: bool = False
+    error: Optional[str] = None
+''')
 
 def generate_nodes(cfg: dict) -> str:
-    etapas = cfg.get('etapas', [])
     apis = cfg.get('apis', [])
     nome = cfg['nome']
-
-    intent_blocks = '\n'.join(dedent(f'''\
-        async def handle_{e["intent"].lower()}(state: ConversationState) -> ConversationState:
-            """Nó: {e["label"]} — {e["descricao"]}"""
-            # TODO: adicionar lógica específica para {e["intent"]}
-            return {{**state, "response": DEFAULT_RESPONSES.get("{e["intent"]}", "")}}
-    ''') for e in etapas)
-
-    tools_block = '\n'.join(f'    # {a["nome"]}: {a["descricao"]}' for a in apis)
+    model = cfg.get('llm_model', 'gpt-4o-mini')
+    etapas = cfg.get('etapas', [])
+    total_steps = len(etapas)
+    tools_block = '\n'.join(f'# {a["nome"]}: {a["descricao"]}' for a in apis)
 
     return dedent(f'''\
-    """Nós de processamento do agente {nome}."""
-    import json
-    from langchain_core.messages import HumanMessage, AIMessage
-    from langchain_openai import ChatOpenAI
-    from .state import ConversationState
-    from ..personality.prompts import (
-        SYSTEM_PROMPT, INTENT_CLASSIFIER_PROMPT,
-        HUMANIZER_SYSTEM_PROMPT, GUARDRAIL_CHECK_PROMPT, DEFAULT_RESPONSES,
+"""Nós de processamento do agente {nome}."""
+import json
+import logging
+from langchain_core.messages import HumanMessage, AIMessage
+from langchain_openai import ChatOpenAI
+from .state import ConversationState
+from ..personality.prompts import (
+    SYSTEM_PROMPT, BRAIN_DECISION_PROMPT, STEP_RULES,
+    DADOS_EXTRAIR, FORMAS_PAGAMENTO, MAX_OBJECOES,
+    HUMANIZER_SYSTEM_PROMPT, GUARDRAIL_CHECK_PROMPT,
+)
+
+logger = logging.getLogger(__name__)
+
+_llm_brain = ChatOpenAI(model="{model}", temperature=0.6)
+_llm_humanizer = ChatOpenAI(model="{model}", temperature=0.8)
+_llm_guardrail = ChatOpenAI(model="{model}", temperature=0.0)
+
+
+def _history_text(state: ConversationState) -> str:
+    lines = []
+    for m in state.messages[-20:]:
+        if isinstance(m, HumanMessage):
+            lines.append(f"Lead: {{m.content}}")
+        elif isinstance(m, AIMessage):
+            lines.append(f"Agente: {{m.content}}")
+    return "\\n".join(lines) or "(início da conversa)"
+
+
+async def main_brain(state: ConversationState) -> ConversationState:
+    """Cérebro central: analisa contexto + decide resposta + avança passo."""
+    history = _history_text(state)
+    last_msg = next(
+        (m.content for m in reversed(state.messages) if isinstance(m, HumanMessage)), ""
     )
-    from ..services.apis import {", ".join(slugify(a["nome"]) + "_client" for a in apis) if apis else "# nenhuma API configurada"}
+    step_rules = STEP_RULES.get(state.current_step, "Sem regras específicas. Use bom senso.")
 
-    _llm_fast = ChatOpenAI(model="{cfg.get("llm_model", "gpt-4o-mini")}", temperature=0.3)
-    _llm_creative = ChatOpenAI(model="{cfg.get("llm_model", "gpt-4o-mini")}", temperature=0.8)
+    # Contexto de dados extraídos do lead
+    extracted_lines = []
+    for campo in DADOS_EXTRAIR:
+        val = getattr(state, campo, "") or "(não informado)"
+        extracted_lines.append(f"  {{campo}}: {{val}}")
+    extracted_ctx = "\\n".join(extracted_lines) or "  (nenhum dado extraído ainda)"
 
+    # Contexto de objeções
+    if state.objection_count >= MAX_OBJECOES:
+        objecao_ctx = "⚠️ LIMITE DE OBJEÇÕES ATINGIDO: pivot para alternativa ou encerramento."
+    elif state.objection_count > 0:
+        objecao_ctx = f"Objeções registradas: {{state.objection_count}}/{{MAX_OBJECOES}}"
+    else:
+        objecao_ctx = ""
 
-    def _history_text(state: ConversationState) -> str:
-        lines = []
-        for m in state.messages[-20:]:
-            if isinstance(m, HumanMessage):
-                lines.append(f"Lead: {{m.content}}")
-            elif isinstance(m, AIMessage):
-                lines.append(f"Agente: {{m.content}}")
-        return "\\n".join(lines) or "(início da conversa)"
+    prompt = (
+        f"PERSONALIDADE DO AGENTE:\\n{{SYSTEM_PROMPT}}\\n\\n"
+        f"INSTRUÇÕES GERAIS:\\n{{BRAIN_DECISION_PROMPT}}\\n\\n"
+        f"=== CONTEXTO DO ATENDIMENTO ===\\n"
+        f"Passo atual: {{state.current_step}}\\n"
+        f"Sub-estado: {{state.sub_state or 'nenhum'}}\\n"
+        f"Stage: {{state.stage}}\\n"
+        f"{{objecao_ctx}}\\n\\n"
+        f"=== DADOS DO LEAD ===\\n{{extracted_ctx}}\\n\\n"
+        f"=== REGRAS DO PASSO {{state.current_step}} ===\\n{{step_rules}}\\n\\n"
+        f"=== HISTÓRICO DA CONVERSA ===\\n{{history}}\\n\\n"
+        f"=== ÚLTIMA MENSAGEM DO LEAD ===\\n{{last_msg}}"
+    )
 
-
-    async def classify_intent(state: ConversationState) -> ConversationState:
-        """Classifica a intenção da última mensagem."""
-        last_msg = next((m.content for m in reversed(state.messages) if isinstance(m, HumanMessage)), "")
-        resp = await _llm_fast.ainvoke(
-            INTENT_CLASSIFIER_PROMPT.format(message=last_msg)
-        )
-        intent = resp.content.strip().upper()
-        state.current_intent = intent
-        state.intent_history = state.intent_history + [intent]
+    try:
+        resp = await _llm_brain.ainvoke([HumanMessage(content=prompt)])
+        raw = resp.content.strip()
+        if raw.startswith("```"):
+            raw = raw.split("\\n", 1)[1].rsplit("```", 1)[0].strip()
+        decision = json.loads(raw)
+    except Exception as exc:
+        logger.error(f"main_brain parse error: {{exc}}")
+        state.draft_response = "Desculpe, tive um probleminha aqui. Pode repetir?"
         return state
 
+    state.draft_response = decision.get("response", "")
+    state.current_step = int(decision.get("next_step", state.current_step))
+    state.sub_state = decision.get("next_sub_state", "") or ""
 
-    {intent_blocks}
+    if decision.get("increment_objection"):
+        state.objection_count = state.objection_count + 1
 
-    async def handle_fora_escopo(state: ConversationState) -> ConversationState:
-        """Responde tópicos fora do escopo sem sair do personagem."""
-        state.draft_response = "Esse assunto foge um pouco do meu escopo por aqui. Posso te ajudar com outra coisa?"
+    if decision.get("notify_operator"):
+        state.notify_operator = True
+
+    pm = decision.get("payment_method", "")
+    if pm and pm in FORMAS_PAGAMENTO:
+        state.payment_method = pm
+
+    for campo in DADOS_EXTRAIR:
+        val = decision.get(campo, "")
+        if val:
+            setattr(state, campo, val)
+
+    if state.current_step >= {total_steps}:
+        state.stage = "closing"
+
+    logger.info({{"step": state.current_step, "action": decision.get("action"), "stage": state.stage}})
+    return state
+
+
+async def humanize_response(state: ConversationState) -> ConversationState:
+    """Humanizador: reescreve o rascunho como mensagens curtas e naturais."""
+    if not state.draft_response:
         return state
 
-
-    async def generate_response(state: ConversationState) -> ConversationState:
-        """Gera rascunho da resposta com o LLM usando o system prompt do agente."""
-        history = _history_text(state)
-        base = DEFAULT_RESPONSES.get(state.current_intent, "")
-        prompt = (
-            f"{{SYSTEM_PROMPT}}\\n\\n"
-            f"Histórico:\\n{{history}}\\n\\n"
-            f"Resposta base sugerida: {{base}}\\n\\n"
-            f"Escreva a resposta final. Use ||| para separar em múltiplas mensagens se necessário."
-        )
-        resp = await _llm_creative.ainvoke([HumanMessage(content=prompt)])
-        state.draft_response = resp.content.strip()
-        return state
-
-
-    async def humanize_response(state: ConversationState) -> ConversationState:
-        """Passa o rascunho pelo humanizador — quebra em mensagens curtas com |||."""
-        if not state.draft_response:
-            return state
-
-        # Se já tem |||, usa direto sem reprocessar
-        if "|||" in state.draft_response:
-            parts = [p.strip() for p in state.draft_response.split("|||") if p.strip()]
-            state.messages_to_send = parts
-            state.message_delays = [0] + [3] * (len(parts) - 1)
-            return state
-
-        resp = await _llm_creative.ainvoke([
-            {{"role": "system", "content": HUMANIZER_SYSTEM_PROMPT}},
-            {{"role": "user", "content": f"Transforme mantendo o sentido:\\n\\n{{state.draft_response}}"}},
-        ])
-        humanized = resp.content.strip()
-        parts = [p.strip() for p in humanized.split("|||") if p.strip()]
-        if not parts:
-            parts = [state.draft_response]
-
+    if "|||" in state.draft_response:
+        parts = [p.strip() for p in state.draft_response.split("|||") if p.strip()]
         state.messages_to_send = parts
-        # Primeiro delay mínimo 2s (simula digitação), demais 3s
-        state.message_delays = [2] + [3] * (len(parts) - 1)
+        state.message_delays = [0] + [3] * (len(parts) - 1)
         return state
 
+    resp = await _llm_humanizer.ainvoke([
+        {{"role": "system", "content": HUMANIZER_SYSTEM_PROMPT}},
+        {{"role": "user", "content": f"Reescreva naturalmente:\\n\\n{{state.draft_response}}"}},
+    ])
+    humanized = resp.content.strip()
+    parts = [p.strip() for p in humanized.split("|||") if p.strip()]
+    if not parts:
+        parts = [state.draft_response]
 
-    async def apply_guardrails(state: ConversationState) -> ConversationState:
-        """Verifica se alguma mensagem viola as regras antes de enviar."""
-        if not state.messages_to_send:
-            return state
-        full_text = " ".join(state.messages_to_send)
-        check = await _llm_fast.ainvoke(
-            GUARDRAIL_CHECK_PROMPT.format(draft_response=full_text)
+    state.messages_to_send = parts
+    state.message_delays = [2] + [3] * (len(parts) - 1)
+    return state
+
+
+async def apply_guardrails(state: ConversationState) -> ConversationState:
+    """Verifica violações de regras antes de enviar."""
+    if not state.messages_to_send:
+        return state
+    full_text = " ".join(state.messages_to_send)
+    check = await _llm_guardrail.ainvoke(
+        GUARDRAIL_CHECK_PROMPT.format(draft_response=full_text)
+    )
+    if str(check.content).strip().startswith("VIOLATION"):
+        state.guardrail_triggered = True
+        state.messages_to_send = ["Desculpe, não consigo ajudar com isso agora."]
+        state.message_delays = [0]
+    return state
+
+
+async def send_message(state: ConversationState) -> ConversationState:
+    """Envia mensagens via WhatsApp com delays."""
+    from ..services.whatsapp import send_messages_sequence, notify_operator
+    import asyncio
+    if state.messages_to_send:
+        asyncio.create_task(
+            send_messages_sequence(state.phone, state.messages_to_send, state.message_delays)
         )
-        if str(check.content).strip().startswith("VIOLATION"):
-            state.guardrail_triggered = True
-            state.messages_to_send = ["Desculpe, não consigo ajudar com isso agora."]
-            state.message_delays = [0]
-        return state
-
-
-    async def send_message(state: ConversationState) -> ConversationState:
-        """Envia mensagens via WhatsApp com delays entre elas."""
-        from ..services.whatsapp import send_messages_sequence, mark_as_read
-        if state.messages_to_send:
-            import asyncio
-            asyncio.create_task(
-                send_messages_sequence(state.phone, state.messages_to_send, state.message_delays)
+    if state.notify_operator:
+        import os
+        lead_info = ", ".join(
+            f"{{campo}}={{getattr(state, campo, '')}}" for campo in DADOS_EXTRAIR
+        )
+        asyncio.create_task(
+            notify_operator(
+                state.phone,
+                f"🔔 Lead fechou/confirmou! {{lead_info}} | Passo {{state.current_step}}",
             )
-        return state
+        )
+    return state
 
 
-    async def persist_history(state: ConversationState) -> ConversationState:
-        """Persiste histórico no Redis."""
-        from ..memory.redis_memory import redis_memory
-        combined = " | ".join(state.messages_to_send)
-        if state.messages and isinstance(state.messages[-1], HumanMessage):
-            await redis_memory.save_message(state.phone, "user", state.messages[-1].content)
-        if combined:
-            await redis_memory.save_message(state.phone, "assistant", combined)
-        return state
+async def persist_history(state: ConversationState) -> ConversationState:
+    """Persiste mensagem no Redis."""
+    from ..memory.redis_memory import redis_memory
+    combined = " | ".join(state.messages_to_send)
+    if state.messages and isinstance(state.messages[-1], HumanMessage):
+        await redis_memory.save_message(state.phone, "user", state.messages[-1].content)
+    if combined:
+        await redis_memory.save_message(state.phone, "assistant", combined)
+    return state
 
 
-    # APIs disponíveis:
-    {tools_block if tools_block else "    # Nenhuma API externa configurada"}
-    ''')
+{tools_block if tools_block else "# Nenhuma API externa configurada"}
+''')
 
 def generate_graph(cfg: dict) -> str:
-    etapas = cfg.get('etapas', [])
-    intents = [e['intent'] for e in etapas]
-    node_imports = ', '.join([
-        'classify_intent', 'generate_response', 'humanize_response',
-        'apply_guardrails', 'send_message', 'persist_history',
-        'handle_fora_escopo',
-    ] + [f'handle_{i.lower()}' for i in intents])
-
-    routing_cases = '\n        '.join(
-        f'"{i}": "handle_{i.lower()}",' for i in intents
-    )
-
-    node_registrations = '\n'.join(
-        f'    graph.add_node("handle_{i.lower()}", handle_{i.lower()})' for i in intents
-    )
-
-    edges_from_routing = '\n'.join(
-        f'    graph.add_edge("handle_{i.lower()}", "generate_response")' for i in intents
-    )
-
     return dedent(f'''\
-    """Grafo LangGraph do agente {cfg["nome"]}."""
-    from langgraph.graph import StateGraph, END
-    from .state import ConversationState
-    from .nodes import (
-        {node_imports}
-    )
+"""Grafo LangGraph do agente {cfg["nome"]}."""
+from langgraph.graph import StateGraph, END
+from .state import ConversationState
+from .nodes import (
+    main_brain, humanize_response, apply_guardrails, send_message, persist_history,
+)
 
 
-    def route_by_intent(state: ConversationState) -> str:
-        routes = {{
-            {routing_cases}
-            "FORA_ESCOPO": "handle_fora_escopo",
-        }}
-        return routes.get(state.current_intent, "handle_fora_escopo")
+def build_graph():
+    graph = StateGraph(ConversationState)
+
+    graph.add_node("main_brain", main_brain)
+    graph.add_node("humanize_response", humanize_response)
+    graph.add_node("apply_guardrails", apply_guardrails)
+    graph.add_node("send_message", send_message)
+    graph.add_node("persist_history", persist_history)
+
+    graph.set_entry_point("main_brain")
+    graph.add_edge("main_brain", "humanize_response")
+    graph.add_edge("humanize_response", "apply_guardrails")
+    graph.add_edge("apply_guardrails", "send_message")
+    graph.add_edge("send_message", "persist_history")
+    graph.add_edge("persist_history", END)
+
+    return graph.compile()
 
 
-    def build_graph():
-        graph = StateGraph(ConversationState)
-
-        # Pipeline principal
-        graph.add_node("classify_intent", classify_intent)
-        graph.add_node("generate_response", generate_response)
-        graph.add_node("humanize_response", humanize_response)
-        graph.add_node("apply_guardrails", apply_guardrails)
-        graph.add_node("send_message", send_message)
-        graph.add_node("persist_history", persist_history)
-        graph.add_node("handle_fora_escopo", handle_fora_escopo)
-
-        # Nós de intenção
-    {node_registrations}
-
-        # Fluxo: classify → roteamento → generate → humanize → guardrails → send → persist
-        graph.set_entry_point("classify_intent")
-        graph.add_conditional_edges("classify_intent", route_by_intent)
-
-    {edges_from_routing}
-        graph.add_edge("handle_fora_escopo", "generate_response")
-        graph.add_edge("generate_response", "humanize_response")
-        graph.add_edge("humanize_response", "apply_guardrails")
-        graph.add_edge("apply_guardrails", "send_message")
-        graph.add_edge("send_message", "persist_history")
-        graph.add_edge("persist_history", END)
-
-        return graph.compile()
-
-
-    agent = build_graph()
-    ''')
+agent = build_graph()
+''')
 
 def generate_apis_service(cfg: dict) -> str:
     apis = cfg.get('apis', [])
@@ -476,6 +624,216 @@ def generate_apis_service(cfg: dict) -> str:
         '''))
 
     return '\n'.join(clients)
+
+def generate_crm_tools(cfg: dict) -> str:
+    nome = cfg['nome']
+    return dedent(f'''\
+    """
+    Ferramentas de CRM que a IA pode chamar autonomamente.
+    Mapeia para os endpoints do zynk-webhook.
+    """
+    import json
+    import os
+    import httpx
+    from langchain_core.tools import tool
+
+
+    def _headers() -> dict:
+        return {{"x-admin-secret": os.environ.get("ZYNK_ADMIN_SECRET", ""), "Content-Type": "application/json"}}
+
+    def _base() -> str:
+        return os.environ.get("ZYNK_WEBHOOK_URL", "").rstrip("/")
+
+    def _org() -> str:
+        return os.environ.get("ZYNK_ORG_ID", "")
+
+
+    @tool
+    async def listar_estagios_crm() -> str:
+        """Lista todas as etapas disponíveis no kanban do CRM."""
+        if not _base() or not _org():
+            return "CRM não configurado."
+        async with httpx.AsyncClient(timeout=8) as c:
+            r = await c.get(f"{{_base()}}/crm/stages", params={{"orgId": _org()}}, headers=_headers())
+            stages = r.json()
+            if not isinstance(stages, list):
+                return "Erro ao listar etapas."
+            return json.dumps([{{"id": s["id"], "nome": s["name"]}} for s in stages], ensure_ascii=False)
+
+
+    @tool
+    async def buscar_contexto_crm(phone: str) -> str:
+        """Busca o contexto completo do lead no CRM: deal, etapa, notas.
+
+        Args:
+            phone: Número de telefone do lead
+        """
+        if not _base() or not _org():
+            return "CRM não configurado."
+        async with httpx.AsyncClient(timeout=8) as c:
+            r = await c.get(f"{{_base()}}/crm/contact/{{phone}}", params={{"orgId": _org()}}, headers=_headers())
+            if r.status_code == 404:
+                return "Lead ainda não cadastrado no CRM."
+            return json.dumps(r.json(), ensure_ascii=False, default=str)
+
+
+    @tool
+    async def mover_lead(deal_id: str, stage_id: str, nome_etapa_destino: str) -> str:
+        """Move o lead para uma etapa do kanban.
+
+        Args:
+            deal_id: ID do deal no CRM
+            stage_id: ID da etapa de destino (use listar_estagios_crm para obter)
+            nome_etapa_destino: Nome legível da etapa
+        """
+        if not _base() or not _org():
+            return "CRM não configurado."
+        async with httpx.AsyncClient(timeout=8) as c:
+            r = await c.post(
+                f"{{_base()}}/crm/deal/{{deal_id}}/move",
+                json={{"orgId": _org(), "stageId": stage_id, "toStageName": nome_etapa_destino}},
+                headers=_headers(),
+            )
+            return f"Lead movido para '{{nome_etapa_destino}}'." if r.status_code == 200 else f"Erro: {{r.text}}"
+
+
+    @tool
+    async def adicionar_nota_crm(deal_id: str, conteudo: str) -> str:
+        """Adiciona uma nota ao deal do lead. Use para objeções, interesses, contexto relevante.
+
+        Args:
+            deal_id: ID do deal no CRM
+            conteudo: Texto objetivo da nota
+        """
+        if not _base() or not _org():
+            return "CRM não configurado."
+        async with httpx.AsyncClient(timeout=8) as c:
+            r = await c.post(
+                f"{{_base()}}/crm/deal/{{deal_id}}/note",
+                json={{"orgId": _org(), "content": conteudo, "authorType": "ai"}},
+                headers=_headers(),
+            )
+            return "Nota adicionada." if r.status_code == 200 else f"Erro: {{r.text}}"
+
+
+    @tool
+    async def fechar_deal_crm(deal_id: str, status: str) -> str:
+        """Fecha o deal como ganho ('won') ou perdido ('lost').
+
+        Args:
+            deal_id: ID do deal no CRM
+            status: 'won' ou 'lost'
+        """
+        if status not in ("won", "lost"):
+            return "Status inválido. Use 'won' ou 'lost'."
+        if not _base() or not _org():
+            return "CRM não configurado."
+        async with httpx.AsyncClient(timeout=8) as c:
+            r = await c.patch(
+                f"{{_base()}}/crm/deal/{{deal_id}}",
+                json={{"orgId": _org(), "status": status}},
+                headers=_headers(),
+            )
+            label = "ganho" if status == "won" else "perdido"
+            return f"Deal marcado como {{label}}." if r.status_code == 200 else f"Erro: {{r.text}}"
+
+
+    ALL_CRM_TOOLS = [listar_estagios_crm, buscar_contexto_crm, mover_lead, adicionar_nota_crm, fechar_deal_crm]
+    ''')
+
+
+def generate_crm_updater(cfg: dict) -> str:
+    nome = cfg['nome']
+    descricao = cfg.get('descricao', nome)
+    return dedent(f'''\
+    """
+    CRM Updater — roda em background após cada mensagem processada.
+    A IA analisa o contexto e decide autonomamente que ações tomar no CRM.
+    """
+    import os
+    from langchain_core.messages import HumanMessage, AIMessage, ToolMessage
+    from langchain_anthropic import ChatAnthropic
+    from langchain_openai import ChatOpenAI
+
+    from ..agent.crm_tools import ALL_CRM_TOOLS
+
+
+    _SYSTEM = """\\
+    Você é o módulo de CRM do agente {descricao}.
+    Analise o contexto da conversa e execute as ações corretas no CRM.
+
+    Diretrizes:
+    - Chame buscar_contexto_crm primeiro para obter o deal_id e etapa atual
+    - Mova o lead quando houver progressão clara no funil
+    - Adicione notas para objeções, interesses, contexto relevante
+    - Feche como won apenas com compra confirmada, lost apenas com desistência explícita
+    - Se nada relevante aconteceu, não faça nada
+    """
+
+    _PROMPT = """\\
+    Contexto do lead {{phone_masked}}:
+    Nome: {{user_name}} | Etapa: {{stage}} | Ação da IA: {{action}}
+    Objeções: {{objection_count}} | Pagamento detectado: {{payment_method}}
+
+    Histórico recente:
+    {{history}}
+
+    Execute as ações de CRM necessárias.
+    """
+
+
+    def _get_llm():
+        if os.environ.get("ANTHROPIC_API_KEY"):
+            return ChatAnthropic(model=os.environ.get("ANTHROPIC_MODEL", "claude-sonnet-4-6"), temperature=0).bind_tools(ALL_CRM_TOOLS)
+        return ChatOpenAI(model=os.environ.get("OPENAI_MODEL", "gpt-4o-mini"), temperature=0).bind_tools(ALL_CRM_TOOLS)
+
+
+    async def run_crm_update(phone: str, user_name: str, stage: str, action: str,
+                             objection_count: int, payment_method: str, history_messages: list) -> None:
+        """Executa atualização do CRM em background. Chame com asyncio.create_task()."""
+        if not os.environ.get("ZYNK_WEBHOOK_URL") or not os.environ.get("ZYNK_ORG_ID"):
+            return
+
+        lines = []
+        for msg in history_messages[-12:]:
+            if isinstance(msg, HumanMessage):
+                lines.append(f"Lead: {{msg.content}}")
+            elif isinstance(msg, AIMessage) and msg.content:
+                lines.append(f"IA: {{msg.content}}")
+
+        prompt = _PROMPT.format(
+            phone_masked=f"***{{phone[-4:]}}" if len(phone) >= 4 else "****",
+            user_name=user_name or "não identificado",
+            stage=stage, action=action,
+            objection_count=objection_count,
+            payment_method=payment_method or "não detectado",
+            history="\\n".join(lines) or "(sem histórico)",
+        )
+
+        try:
+            llm = _get_llm()
+            messages = [HumanMessage(content=_SYSTEM), HumanMessage(content=prompt)]
+            tool_map = {{t.name: t for t in ALL_CRM_TOOLS}}
+
+            for _ in range(5):
+                response = await llm.ainvoke(messages)
+                messages.append(response)
+                tool_calls = getattr(response, "tool_calls", []) or []
+                if not tool_calls:
+                    break
+                for tc in tool_calls:
+                    fn = tool_map.get(tc["name"])
+                    if not fn:
+                        continue
+                    try:
+                        result = await fn.ainvoke(tc["args"])
+                        messages.append(ToolMessage(content=str(result), tool_call_id=tc["id"]))
+                    except Exception as te:
+                        messages.append(ToolMessage(content=f"Erro: {{te}}", tool_call_id=tc["id"]))
+        except Exception:
+            pass
+    ''')
+
 
 def generate_gitignore() -> str:
     return dedent('''\
@@ -517,6 +875,11 @@ def generate_env_example(cfg: dict) -> str:
 
     # Notificações
     NOTIFICATION_WHATSAPP={notif.get("whatsapp", "")}
+
+    # Zynk CRM (opcional — preencha para habilitar atualizações automáticas no kanban)
+    ZYNK_WEBHOOK_URL=https://zynk-webhook.caxgyu.easypanel.host
+    ZYNK_ADMIN_SECRET=
+    ZYNK_ORG_ID=
     ''')
 
 def generate_agents_md(cfg: dict) -> str:
@@ -699,6 +1062,7 @@ def generate_webhooks(cfg: dict) -> str:
     from ..services.whatsapp import (
         parse_incoming, send_messages_sequence, mark_as_read,
     )
+    from ..services.crm_updater import run_crm_update
 
     router = APIRouter(prefix="/webhook")
 
@@ -806,13 +1170,21 @@ def generate_webhooks(cfg: dict) -> str:
             session = {{}}
             history = []
 
-        state = ConversationState(
+        from ..personality.prompts import DADOS_EXTRAIR
+
+        state_kwargs = dict(
             phone=phone,
             messages=history + [HumanMessage(content=combined_text)],
             stage=session.get("stage", "nurturing"),
-            user_name=session.get("user_name", ""),
-            context=session.get("context", {{}}),
+            current_step=session.get("current_step", 1),
+            sub_state=session.get("sub_state", ""),
+            objection_count=session.get("objection_count", 0),
+            payment_method=session.get("payment_method", ""),
         )
+        for campo in DADOS_EXTRAIR:
+            state_kwargs[campo] = session.get(campo, "")
+
+        state = ConversationState(**state_kwargs)
 
         raw = await agent.ainvoke(state)
 
@@ -820,17 +1192,31 @@ def generate_webhooks(cfg: dict) -> str:
         message_delays: list[int] = raw.get("message_delays") or []
 
         if messages_to_send:
-            # Garante mínimo de 2s no primeiro (simula digitação)
             if message_delays:
                 message_delays[0] = max(message_delays[0], 2)
             asyncio.create_task(send_messages_sequence(phone, messages_to_send, message_delays))
 
-        await redis_memory.save_session(phone, {{
+        session_data = {{
             "stage": raw.get("stage", "nurturing"),
             "current_step": raw.get("current_step", step),
-            "user_name": raw.get("user_name", ""),
-            "context": raw.get("context", {{}}),
-        }})
+            "sub_state": raw.get("sub_state", ""),
+            "objection_count": raw.get("objection_count", 0),
+            "payment_method": raw.get("payment_method", ""),
+        }}
+        for campo in DADOS_EXTRAIR:
+            session_data[campo] = raw.get(campo, "")
+        await redis_memory.save_session(phone, session_data)
+
+        # CRM update autônomo (fire-and-forget)
+        asyncio.create_task(run_crm_update(
+            phone=phone,
+            user_name=raw.get("user_name", ""),
+            stage=raw.get("stage", "nurturing"),
+            action=raw.get("current_intent", ""),
+            objection_count=raw.get("objection_count", 0),
+            payment_method=raw.get("payment_method", ""),
+            history_messages=raw.get("messages", []),
+        ))
 
 
     @router.post("/reset-session")
@@ -894,12 +1280,14 @@ def cmd_create(args):
 
     # Gerar arquivos
     files = {
-        f'src/{nome}/agent/graph.py':        generate_graph(cfg),
-        f'src/{nome}/agent/nodes.py':         generate_nodes(cfg),
-        f'src/{nome}/agent/state.py':         generate_state(cfg),
-        f'src/{nome}/personality/prompts.py': generate_prompts(cfg),
-        f'src/{nome}/services/apis.py':       generate_apis_service(cfg),
-        f'src/{nome}/api/webhooks.py':        generate_webhooks(cfg),
+        f'src/{nome}/agent/graph.py':           generate_graph(cfg),
+        f'src/{nome}/agent/nodes.py':            generate_nodes(cfg),
+        f'src/{nome}/agent/state.py':            generate_state(cfg),
+        f'src/{nome}/agent/crm_tools.py':        generate_crm_tools(cfg),
+        f'src/{nome}/personality/prompts.py':    generate_prompts(cfg),
+        f'src/{nome}/services/apis.py':          generate_apis_service(cfg),
+        f'src/{nome}/services/crm_updater.py':   generate_crm_updater(cfg),
+        f'src/{nome}/api/webhooks.py':           generate_webhooks(cfg),
         f'src/{nome}/main.py':                generate_main(cfg),
         'AGENTS.md':                          generate_agents_md(cfg),
         '.env.example':                       generate_env_example(cfg),
@@ -1517,6 +1905,52 @@ def cmd_wizard(args):
         print('  (usando etapas padrão)')
     cfg['etapas'] = etapas
 
+    # ── Dados a extrair ──────────────────────────────────────────────────────
+    print('\n── 3.5. DADOS DO LEAD A EXTRAIR ───────────────────────')
+    print('Quais informações o agente deve extrair do lead durante a conversa?')
+    print('Ex: nome, interesse, área de problema, empresa, cargo...')
+    print()
+    dados_extrair = []
+    k = 1
+    while True:
+        campo_label = ask(f'Dado {k} — nome/label (ex: nome, interesse, empresa; vazio para terminar)')
+        if not campo_label:
+            break
+        campo_slug = 'extracted_' + slugify(campo_label)
+        descricao_campo = ask(f'  Descrição de "{campo_label}"', f'{campo_label} do lead')
+        dados_extrair.append({'campo': campo_slug, 'descricao': descricao_campo})
+        k += 1
+    if not dados_extrair:
+        dados_extrair = [{'campo': 'extracted_nome', 'descricao': 'Primeiro nome do lead'}]
+        print('  (usando apenas: extracted_nome)')
+    cfg['dados_extrair'] = dados_extrair
+
+    # ── Humanização ──────────────────────────────────────────────────────────
+    print('\n── 3.6. HUMANIZAÇÃO E VOCABULÁRIO ─────────────────────')
+    print('Configure como o agente vai soar mais humano.')
+    print()
+    subs = {}
+    print('Substituições de vocabulário (ex: "problema" -> "desafio"):')
+    while True:
+        palavra = ask('  Palavra original (vazio para terminar)')
+        if not palavra:
+            break
+        substituto = ask(f'  Substituir "{palavra}" por')
+        if substituto:
+            subs[palavra] = substituto
+    conectores_input = ask(
+        'Conectores naturais (separados por vírgula)',
+        'olha, sabe?, então, é que'
+    )
+    conectores = [c.strip() for c in conectores_input.split(',') if c.strip()]
+    cfg['vocabulario'] = {'substituicoes': subs, 'conectores': conectores}
+
+    # ── Pagamento e objeções ─────────────────────────────────────────────────
+    print('\n── 3.7. PAGAMENTO E OBJEÇÕES ──────────────────────────')
+    formas_input = ask('Formas de pagamento (separadas por vírgula)', 'pix, cartao')
+    cfg['formas_pagamento'] = [f.strip() for f in formas_input.split(',') if f.strip()]
+    cfg['max_objecoes'] = int(ask('Máximo de objeções antes de pivotar', '2'))
+
     # ── APIs ─────────────────────────────────────────────────────────────────
     print('\n── 4. APIS EXTERNAS ───────────────────────────────────')
     print('O agente precisa consultar algum sistema externo?')
@@ -1633,10 +2067,12 @@ def cmd_wizard(args):
     print(f'  Agente: {cfg["nome"]}')
     print(f'  Cliente: {cfg["cliente"]}')
     print(f'  Etapas: {len(cfg["etapas"])}')
+    print(f'  Dados extrair: {len(cfg.get("dados_extrair", []))} campos')
+    print(f'  Formas de pagamento: {", ".join(cfg.get("formas_pagamento", []))}')
+    print(f'  Max objeções: {cfg.get("max_objecoes", 2)}')
+    vocab = cfg.get("vocabulario", {})
+    print(f'  Substituições vocab: {len(vocab.get("substituicoes", {}))}')
     print(f'  APIs: {len(cfg["apis"])}')
-    print(f'  Transferências: {len(cfg["casos_transferencia"])}')
-    print(f'  Fluxo CRM: {len(cfg.get("fluxo_crm", []))} mapeamentos')
-    print(f'  Follow-up: {"ativo" if cfg.get("follow_up", {}).get("ativo") else "desativado"}')
     print(f'  Regras: {len(cfg["regras"])}')
     if github_owner:
         print(f'  GitHub: {github_owner}/{cfg["nome"].replace("_", "-")} (privado)')
