@@ -455,6 +455,8 @@ async def main_brain(state: ConversationState) -> ConversationState:
         decision = json.loads(raw)
     except Exception as exc:
         logger.error(f"main_brain parse error: {{exc}}")
+        from ..memory.redis_memory import redis_memory as _rm
+        await _rm.log_event("{nome}", "error", {{"msg": str(exc)[:300], "step": state.current_step, "raw": raw[:200] if "raw" in dir() else ""}})
         state.draft_response = "Desculpe, tive um probleminha aqui. Pode repetir?"
         return state
 
@@ -519,6 +521,8 @@ async def apply_guardrails(state: ConversationState) -> ConversationState:
     )
     if str(check.content).strip().startswith("VIOLATION"):
         state.guardrail_triggered = True
+        from ..memory.redis_memory import redis_memory as _rm
+        await _rm.log_event("{nome}", "guardrail", {{"violation": str(check.content)[:200], "text": full_text[:200]}})
         state.messages_to_send = ["Desculpe, não consigo ajudar com isso agora."]
         state.message_delays = [0]
     return state
@@ -1028,21 +1032,105 @@ def generate_pyproject(cfg: dict) -> str:
     build-backend = "hatchling.build"
     ''')
 
+def generate_metrics_endpoint(cfg: dict) -> str:
+    nome = cfg['nome']
+    etapas = cfg.get('etapas', [])
+    for i, e in enumerate(etapas):
+        if 'passo' not in e:
+            e['passo'] = i + 1
+    step_labels = {e['passo']: e['label'] for e in etapas}
+    step_labels_repr = repr(step_labels)
+
+    return dedent(f'''\
+"""Endpoint /metrics — dados em tempo real do agente {nome}."""
+import json
+from fastapi import APIRouter
+from ..memory.redis_memory import redis_memory
+
+router = APIRouter()
+
+AGENT_NAME = "{nome}"
+STEP_LABELS: dict[int, str] = {step_labels_repr}
+
+
+@router.get("/metrics")
+async def get_metrics():
+    r = await redis_memory.client()
+
+    # Sessões ativas via SCAN (evita KEYS em produção)
+    sessions = []
+    cursor = 0
+    while True:
+        cursor, keys = await r.scan(cursor, match="session:*", count=200)
+        for key in keys:
+            raw = await r.get(key)
+            if raw:
+                try:
+                    sessions.append(json.loads(raw))
+                except Exception:
+                    pass
+        if cursor == 0:
+            break
+
+    # Distribuição por passo e stage
+    step_counts: dict[str, int] = {{}}
+    stage_counts: dict[str, int] = {{}}
+    for s in sessions:
+        step = s.get("current_step", 1)
+        label = STEP_LABELS.get(int(step), f"Passo {{step}}")
+        key = f"{{step}} — {{label}}"
+        step_counts[key] = step_counts.get(key, 0) + 1
+        stage = s.get("stage", "nurturing")
+        stage_counts[stage] = stage_counts.get(stage, 0) + 1
+
+    # Erros e guardrails dos últimos 7 dias
+    errors_raw = await r.lrange(f"metrics:{{AGENT_NAME}}:errors", 0, 49)
+    guardrails_raw = await r.lrange(f"metrics:{{AGENT_NAME}}:guardrails", 0, 49)
+
+    errors = []
+    for e in errors_raw:
+        try:
+            errors.append(json.loads(e))
+        except Exception:
+            pass
+
+    guardrails = []
+    for g in guardrails_raw:
+        try:
+            guardrails.append(json.loads(g))
+        except Exception:
+            pass
+
+    return {{
+        "agent": AGENT_NAME,
+        "active_sessions": len(sessions),
+        "step_distribution": dict(sorted(step_counts.items())),
+        "stage_distribution": stage_counts,
+        "error_count": len(errors),
+        "recent_errors": errors[:10],
+        "guardrail_count": len(guardrails),
+        "recent_guardrails": guardrails[:5],
+    }}
+''')
+
+
 def generate_main(cfg: dict) -> str:
     nome = cfg['nome']
     return dedent(f'''\
-    """Entry point do agente {nome}."""
-    from fastapi import FastAPI
-    from .api.webhooks import router as webhook_router
+"""Entry point do agente {nome}."""
+from fastapi import FastAPI
+from .api.webhooks import router as webhook_router
+from .api.metrics import router as metrics_router
 
-    app = FastAPI(title="{nome}", version="0.1.0")
-    app.include_router(webhook_router)
+app = FastAPI(title="{nome}", version="0.1.0")
+app.include_router(webhook_router)
+app.include_router(metrics_router)
 
 
-    @app.get("/health")
-    async def health():
-        return {{"status": "ok", "agent": "{nome}"}}
-    ''')
+@app.get("/health")
+async def health():
+    return {{"status": "ok", "agent": "{nome}"}}
+''')
 
 def generate_webhooks(cfg: dict) -> str:
     nome = cfg['nome']
@@ -1288,6 +1376,7 @@ def cmd_create(args):
         f'src/{nome}/services/apis.py':          generate_apis_service(cfg),
         f'src/{nome}/services/crm_updater.py':   generate_crm_updater(cfg),
         f'src/{nome}/api/webhooks.py':           generate_webhooks(cfg),
+        f'src/{nome}/api/metrics.py':            generate_metrics_endpoint(cfg),
         f'src/{nome}/main.py':                generate_main(cfg),
         'AGENTS.md':                          generate_agents_md(cfg),
         '.env.example':                       generate_env_example(cfg),
@@ -1563,6 +1652,18 @@ def _copy_base_services(output_dir: Path, nome: str):
         async def get_wamid(self, wamid: str) -> str | None:
             r = await self.client()
             return await r.get(f"wamid:{wamid}")
+
+        # ── Métricas ────────────────────────────────────────────────────────
+        # Grava eventos para o dashboard de monitoramento
+
+        async def log_event(self, agent_name: str, event_type: str, data: dict) -> None:
+            import time
+            r = await self.client()
+            entry = json.dumps({"type": event_type, "ts": int(time.time()), **data})
+            key = f"metrics:{agent_name}:{event_type}s"
+            await r.lpush(key, entry)
+            await r.ltrim(key, 0, 99)
+            await r.expire(key, 86400 * 7)  # mantém 7 dias
 
 
     redis_memory = RedisMemory()
